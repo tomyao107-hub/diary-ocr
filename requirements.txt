@@ -1,0 +1,4 @@
+PyQt6==6.11.0
+Pillow==12.3.0
+openai==2.45.0
+python-dotenv==1.2.2

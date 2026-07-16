@@ -1,0 +1,17 @@
+# 虚拟环境与 Python 缓存
+.venv/
+__pycache__/
+*.py[cod]
+
+# 环境变量 / 密钥
+.env
+
+# OCR 输出与临时文件
+*.tmp
+final_diary_output.md
+
+# 编辑器 / 操作系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
