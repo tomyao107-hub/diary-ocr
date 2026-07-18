@@ -9,14 +9,14 @@ if not exist "%VENV_PYTHON%" (
     if errorlevel 1 goto :error
 )
 
-"%VENV_PYTHON%" -c "import PyQt6, PIL, openai" >nul 2>&1
+"%VENV_PYTHON%" -c "import PyQt6, PIL, openai, fitz" >nul 2>&1
 if errorlevel 1 (
     echo Installing project dependencies...
     "%VENV_PYTHON%" -m pip install -r requirements.txt
     if errorlevel 1 goto :error
 )
 
-"%VENV_PYTHON%" "diary_ocr_app (5).py" %*
+"%VENV_PYTHON%" "diary_ocr_app.py" %*
 if errorlevel 1 goto :error
 exit /b 0
 

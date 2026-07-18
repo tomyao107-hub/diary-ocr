@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QApplication
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_PATH = ROOT / "diary_ocr_app (5).py"
+APP_PATH = ROOT / "diary_ocr" / "editor.py"
 SPEC = importlib.util.spec_from_file_location("diary_ocr_app", APP_PATH)
 app_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(app_module)
