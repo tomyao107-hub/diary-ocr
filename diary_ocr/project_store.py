@@ -21,18 +21,36 @@ def _now() -> str:
 def _atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    try:
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def slugify(name: str) -> str:
     normalized = unicodedata.normalize("NFKC", name).strip()
     slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", normalized, flags=re.UNICODE)
     slug = re.sub(r"[-_]{2,}", "-", slug).strip("-_. ")
-    return slug[:80] or "project"
+    slug = slug[:80] or "project"
+    # Windows device names cannot be used as folder names.
+    if slug.upper() in _WINDOWS_RESERVED or slug.upper().split(".")[0] in _WINDOWS_RESERVED:
+        slug = f"project-{slug}"
+    return slug
 
 
 @dataclass(frozen=True)
@@ -64,7 +82,17 @@ class Project:
     def page_count(self) -> int:
         if not self.pages_dir.exists():
             return 0
-        return sum(1 for item in self.pages_dir.iterdir() if item.is_file())
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+        try:
+            return sum(
+                1
+                for item in self.pages_dir.iterdir()
+                if item.is_file()
+                and not item.name.startswith(".")
+                and item.suffix.lower() in image_exts
+            )
+        except OSError:
+            return 0
 
 
 class ProjectStore:
@@ -115,8 +143,15 @@ class ProjectStore:
         self._ensure_root()
         archived = set(self._index()["archived"])
         projects = []
-        for child in self.root.iterdir():
-            if not child.is_dir():
+        try:
+            children = list(self.root.iterdir())
+        except OSError:
+            return []
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
                 continue
             project = self._from_path(child)
             if project and (include_archived or project.id not in archived):
@@ -157,9 +192,21 @@ class ProjectStore:
 
     def touch(self, project: Project) -> Project:
         metadata_path = project.path / "project.json"
-        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        try:
+            raw = metadata_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OSError(f"无法读取项目元数据：{metadata_path}") from exc
+        if not isinstance(data, dict):
+            raise OSError("项目元数据格式无效")
         data["updated_at"] = _now()
         data["schema_version"] = PROJECT_SCHEMA_VERSION
+        if not data.get("id"):
+            data["id"] = project.id
+        if not data.get("name"):
+            data["name"] = project.name
+        if not data.get("created_at"):
+            data["created_at"] = project.created_at or _now()
         _atomic_json(metadata_path, data)
         refreshed = self._from_path(project.path)
         if refreshed is None:

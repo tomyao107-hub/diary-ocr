@@ -25,17 +25,27 @@ def load_global_config() -> dict:
 
 def save_global_config(config: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = CONFIG_PATH.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(CONFIG_PATH)
+    temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(CONFIG_PATH)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def projects_root(config: dict | None = None) -> Path:
     value = (config or load_global_config()).get(
         "projects_root", str(DEFAULT_PROJECTS_ROOT)
     )
-    return Path(value).expanduser().resolve()
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return DEFAULT_PROJECTS_ROOT.expanduser().resolve()
 

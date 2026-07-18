@@ -50,6 +50,8 @@ class ProjectWorkflowTests(unittest.TestCase):
                 )
                 merged = project.output_dir / "final_diary_output.md"
                 self.assertIn("校对后的日记文字", merged.read_text(encoding="utf-8"))
+                # Merge must not wipe project progress (reopen recovery).
+                self.assertTrue(restored._session.exists() or project.session_path.exists())
                 restored._auto_save_timer.stop()
                 restored.deleteLater()
 

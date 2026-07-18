@@ -33,6 +33,10 @@ def inspect_pdf(path: Path) -> PDFInfo:
     except Exception as exc:
         raise ValueError(f"无法打开 PDF：{exc}") from exc
     try:
+        if document.is_encrypted and document.needs_pass:
+            return PDFInfo(document.page_count, True)
+        if document.page_count < 1:
+            raise ValueError("PDF 没有可导入的页面")
         return PDFInfo(document.page_count, bool(document.needs_pass))
     finally:
         document.close()
@@ -59,18 +63,25 @@ def import_pdf(
     fitz = _fitz()
     project_root = Path(project_root).resolve()
     pdf_path = Path(pdf_path).resolve()
+    if not pdf_path.is_file():
+        raise ValueError(f"PDF 文件不存在：{pdf_path}")
     sources_dir = project_root / "sources"
     pages_dir = project_root / "pages"
     sources_dir.mkdir(parents=True, exist_ok=True)
     pages_dir.mkdir(parents=True, exist_ok=True)
     source_copy = unique_path(sources_dir, pdf_path.name)
-    shutil.copy2(pdf_path, source_copy)
+    try:
+        shutil.copy2(pdf_path, source_copy)
+    except OSError as exc:
+        raise OSError(f"无法复制 PDF 到项目：{exc}") from exc
     generated: list[Path] = []
     try:
         document = fitz.open(str(source_copy))
         try:
             if document.needs_pass:
                 raise ValueError("暂不支持加密 PDF")
+            if document.page_count < 1:
+                raise ValueError("PDF 没有可导入的页面")
             final_page = document.page_count if end_page is None else int(end_page)
             validate_page_range(document.page_count, int(start_page), final_page)
             total = final_page - int(start_page) + 1
@@ -82,27 +93,35 @@ def import_pdf(
                 if cancelled and cancelled():
                     raise PDFImportCancelled("PDF 导入已取消")
                 page = document.load_page(page_number - 1)
-                pixmap = page.get_pixmap(
-                    matrix=matrix,
-                    colorspace=fitz.csRGB,
-                    alpha=False,
-                )
-                destination = unique_path(
-                    pages_dir,
-                    f"{source_copy.stem}_p{page_number:04d}.jpg",
-                )
-                pixmap.save(str(destination), jpg_quality=90)
+                try:
+                    pixmap = page.get_pixmap(
+                        matrix=matrix,
+                        colorspace=fitz.csRGB,
+                        alpha=False,
+                    )
+                    destination = unique_path(
+                        pages_dir,
+                        f"{source_copy.stem}_p{page_number:04d}.jpg",
+                    )
+                    pixmap.save(str(destination), jpg_quality=90)
+                finally:
+                    del page
                 generated.append(destination)
                 if progress:
                     progress(completed, total, destination)
                 del pixmap
-                del page
         finally:
             document.close()
     except Exception:
         for path in generated:
-            path.unlink(missing_ok=True)
-        source_copy.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            source_copy.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     return generated
 

@@ -47,6 +47,7 @@ class ProjectSession:
         done_indices: set[int],
         draft_texts: dict[int, str],
     ) -> bool:
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
             pages = [self._relative(path) for path in image_paths]
             current_page = (
@@ -70,7 +71,7 @@ class ProjectSession:
                 "done_pages": done_pages,
                 "drafts": drafts,
             }
-            temporary = self.path.with_suffix(".tmp")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -78,6 +79,10 @@ class ProjectSession:
             temporary.replace(self.path)
             return True
         except (OSError, TypeError, ValueError):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
             return False
 
     def load(self) -> dict | None:
@@ -85,29 +90,60 @@ class ProjectSession:
             return None
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            if data.get("schema_version") != SESSION_SCHEMA_VERSION:
+            if not isinstance(data, dict):
+                return None
+            if data.get("schema_version", SESSION_SCHEMA_VERSION) != SESSION_SCHEMA_VERSION:
                 return None
             pages = data.get("pages", [])
             if not isinstance(pages, list) or not pages:
                 return None
-            absolute_pages = [self._absolute(path) for path in pages]
-            current = data.get("current_page")
+
+            absolute_pages: list[str] = []
+            for path in pages:
+                if not isinstance(path, str):
+                    continue
+                try:
+                    absolute_pages.append(self._absolute(path))
+                except ValueError:
+                    # Skip path-traversal or unresolvable entries instead of
+                    # discarding the entire session.
+                    continue
+            if not absolute_pages:
+                return None
+
+            def _safe_absolute(path: str | None) -> str | None:
+                if not isinstance(path, str) or not path:
+                    return None
+                try:
+                    return self._absolute(path)
+                except ValueError:
+                    return None
+
+            current = _safe_absolute(data.get("current_page"))
             done = data.get("done_pages", [])
             drafts = data.get("drafts", {})
+            done_paths = set()
+            if isinstance(done, list):
+                for path in done:
+                    resolved = _safe_absolute(path) if isinstance(path, str) else None
+                    if resolved:
+                        done_paths.add(resolved)
+            draft_texts = {}
+            if isinstance(drafts, dict):
+                for path, text in drafts.items():
+                    if not isinstance(path, str) or not isinstance(text, str):
+                        continue
+                    resolved = _safe_absolute(path)
+                    if resolved:
+                        draft_texts[resolved] = text
             return {
                 "schema_version": SESSION_SCHEMA_VERSION,
                 "saved_at": data.get("saved_at", ""),
                 "output_dir": str(self.project_root / "output"),
                 "image_paths": absolute_pages,
-                "current_path": self._absolute(current) if current else absolute_pages[0],
-                "done_paths": {
-                    self._absolute(path) for path in done if isinstance(path, str)
-                },
-                "draft_texts": {
-                    self._absolute(path): text
-                    for path, text in drafts.items()
-                    if isinstance(path, str) and isinstance(text, str)
-                },
+                "current_path": current or absolute_pages[0],
+                "done_paths": done_paths,
+                "draft_texts": draft_texts,
             }
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None

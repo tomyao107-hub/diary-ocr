@@ -26,19 +26,38 @@ class ApplicationController:
         self.home.show()
 
     def open_project(self, project: Project) -> None:
-        self.editor = ProjectEditor(
-            project,
-            self.store,
-            int(self.config.get("pdf_dpi", 300)),
-        )
+        if self.editor is not None:
+            # Avoid stacking multiple editors if a signal fires twice.
+            return
+        try:
+            dpi = int(self.config.get("pdf_dpi", 300))
+        except (TypeError, ValueError):
+            dpi = 300
+        dpi = max(72, min(600, dpi))
+        self.editor = ProjectEditor(project, self.store, dpi)
         self.editor.back_requested.connect(self.return_home)
         self.home.hide()
         self.editor.show()
 
     def return_home(self) -> None:
         if self.editor:
-            self.config["pdf_dpi"] = self.editor.pdf_dpi
-            save_global_config(self.config)
+            try:
+                dpi = int(self.editor.pdf_dpi)
+            except (TypeError, ValueError):
+                dpi = int(self.config.get("pdf_dpi", 300) or 300)
+            # Reload from disk so API settings saved inside the editor are not
+            # overwritten by a stale in-memory home config.
+            disk = load_global_config()
+            disk["pdf_dpi"] = max(72, min(600, dpi))
+            disk["projects_root"] = self.config.get(
+                "projects_root", disk.get("projects_root")
+            )
+            self.config = disk
+            self.home.config = self.config
+            try:
+                save_global_config(self.config)
+            except OSError:
+                pass
             self.editor.deleteLater()
             self.editor = None
         self.home.refresh()
@@ -47,6 +66,8 @@ class ApplicationController:
         self.home.activateWindow()
 
     def change_root(self, new_root: str) -> None:
+        if new_root:
+            self.config["projects_root"] = str(new_root)
         self.store = ProjectStore(projects_root(self.config))
         self.home.store = self.store
         self.home.refresh()

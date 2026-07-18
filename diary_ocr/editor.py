@@ -148,8 +148,15 @@ def _existing_output_path(
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 DEFAULT_PROMPT = (
     "这是一份历史手写日记的扫描件，版式为竖排。"
@@ -672,7 +679,12 @@ class OCRAPIClient:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        return response.choices[0].message.content.strip()
+        if not response.choices:
+            raise RuntimeError("OCR API 返回空 choices，请检查模型与配额")
+        content = response.choices[0].message.content
+        if content is None:
+            raise RuntimeError("OCR API 返回空内容，请检查模型与提示词设置")
+        return content.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1927,8 +1939,12 @@ class MainWindow(QMainWindow):
     def _save_config(self):
         try:
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._config, f, ensure_ascii=False, indent=2)
+            temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self._config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(CONFIG_PATH)
         except Exception as e:
             self._log(f"⚠️ 保存配置失败: {e}")
 
@@ -1987,9 +2003,13 @@ class MainWindow(QMainWindow):
 
         self._log(f"📂 已加载 {len(paths)} 张图片")
 
-        # 恢复已完成状态的列表颜色
+        # 恢复已完成 / 已有草稿页面的列表颜色
         for idx in self._done_indices:
             self._mark_item_done(idx)
+        if restore_texts:
+            for idx in restore_texts:
+                if idx not in self._done_indices:
+                    self._mark_item_done(idx)
 
         self._set_current(max(0, min(start_index, len(paths) - 1)))
         self._update_buttons()
@@ -2548,15 +2568,17 @@ class MainWindow(QMainWindow):
             number = len(parts) + 1
             parts.append(f"### 第 {number} 篇  —  {Path(image_path).stem}\n\n{content}")
 
+        if not parts:
+            QMessageBox.warning(self, "合并失败", "已有结果均无法读取，未生成合并文件。")
+            return
+
         merged = "\n\n---\n\n".join(parts)
         try:
             _write_text_atomic(final_path, merged)
             self._log(f"📄 合并完成，共 {len(parts)} 篇 → {final_path}")
-            if not missing and len(parts) == len(self._image_paths):
-                self._session.clear()
-                self._auto_save_timer.stop()
-                self._lbl_autosave.setText("")
-                self._log("🗑 会话进度已清除（合并完成）")
+            # Keep the project/session queue after merge so custom order and
+            # reopen recovery remain intact. Progress can still be cleared manually.
+            self._session_save_silent()
             QMessageBox.information(
                 self, "合并成功",
                 f"已将 {len(parts)} 篇日记合并为：\n{final_path}"
@@ -2615,6 +2637,9 @@ class MainWindow(QMainWindow):
             self._set_status("⚠️ 尚未加载图片，无进度可保存")
             return
         ok = self._session_save_silent()
+        session_file = getattr(self._session, "path", None) or getattr(
+            self._session, "_path", SESSION_PATH
+        )
         if ok:
             done  = len(self._done_indices)
             total = len(self._image_paths)
@@ -2623,11 +2648,11 @@ class MainWindow(QMainWindow):
                 f"  • 已完成（写盘）：{done} / {total} 张\n"
                 f"  • 草稿（仅在会话中）：{len(self._ocr_texts) - done} 张\n"
                 f"  • 当前位置：第 {self._current_index + 1} 张\n\n"
-                f"会话文件：{SESSION_PATH}"
+                f"会话文件：{session_file}"
             )
             QMessageBox.information(self, "进度已保存 ✅", msg)
         else:
-            QMessageBox.warning(self, "保存失败", f"写入会话文件失败：\n{SESSION_PATH}")
+            QMessageBox.warning(self, "保存失败", f"写入会话文件失败：\n{session_file}")
 
     def _offer_restore_session(self):
         """
@@ -2708,10 +2733,13 @@ class MainWindow(QMainWindow):
         if not self._session.exists():
             QMessageBox.information(self, "提示", "当前没有保存的进度文件。")
             return
+        session_file = getattr(self._session, "path", None) or getattr(
+            self._session, "_path", SESSION_PATH
+        )
         reply = QMessageBox.question(
             self,
             "确认清除进度",
-            f"这将删除会话文件：\n{SESSION_PATH}\n\n"
+            f"这将删除会话文件：\n{session_file}\n\n"
             "注意：已写盘的 .md 文件不受影响，仅清除中间进度记录。\n\n"
             "确认清除？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

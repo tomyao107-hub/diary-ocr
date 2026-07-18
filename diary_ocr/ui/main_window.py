@@ -23,6 +23,10 @@ from ..project_store import Project, ProjectStore
 from ..session import ProjectSession
 
 
+def _canonical(path: str) -> str:
+    return legacy._canonical_path(path)
+
+
 class PDFImportWorker(QThread):
     progress = pyqtSignal(int, int, str)
     succeeded = pyqtSignal(list)
@@ -70,6 +74,8 @@ class PDFImportWorker(QThread):
 class PDFRangeDialog(QDialog):
     def __init__(self, page_count: int, dpi: int, parent=None):
         super().__init__(parent)
+        if page_count < 1:
+            raise ValueError("PDF 没有可导入的页面")
         self.setWindowTitle("导入 PDF")
         layout = QFormLayout(self)
         layout.addRow("总页数", QLabel(str(page_count)))
@@ -111,6 +117,10 @@ class ProjectEditor(legacy.MainWindow):
         self._pdf_worker: PDFImportWorker | None = None
         self._pdf_progress: QProgressDialog | None = None
         super().__init__()
+        # Keep the user's global output_dir; projects always write under output/.
+        self._global_output_dir = self._config.get(
+            "output_dir", str(Path.home() / "diary_ocr_output")
+        )
         self._session = ProjectSession(project.path)
         self._config["output_dir"] = str(project.output_dir)
         self.setWindowTitle(f"{project.name} — Diary OCR 1.0")
@@ -158,8 +168,12 @@ class ProjectEditor(legacy.MainWindow):
         if self._current_index >= 0:
             self._ocr_texts[self._current_index] = self._text_editor.toPlainText()
         existing = list(self._image_paths)
-        new_pages = [path for path in pages if path not in existing]
+        existing_keys = {_canonical(path) for path in existing}
+        new_pages = [
+            path for path in pages if _canonical(path) not in existing_keys
+        ]
         if not new_pages:
+            self._log("ℹ️ 所选图片均已在当前队列中，未重复导入")
             return
         start_index = self._current_index if existing else 0
         self._load_images(
@@ -168,11 +182,16 @@ class ProjectEditor(legacy.MainWindow):
             restore_done=set(self._done_indices),
             restore_texts=dict(self._ocr_texts),
         )
-        self.project = self.store.touch(self.project)
+        try:
+            self.project = self.store.touch(self.project)
+        except OSError as exc:
+            self._log(f"⚠️ 更新项目时间失败：{exc}")
         self._log(f"✅ 已导入 {len(new_pages)} 页到项目")
 
     def _open_files(self):
-        if self._batch_ui_running:
+        if self._batch_ui_running or (
+            self._pdf_worker and self._pdf_worker.isRunning()
+        ):
             return
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -182,30 +201,55 @@ class ProjectEditor(legacy.MainWindow):
         )
         if not paths:
             return
+        errors: list[str] = []
+
+        def _on_error(source: Path, exc: OSError) -> None:
+            errors.append(f"{source.name}: {exc}")
+
         try:
             imported = import_images(
                 self.project.path,
                 [Path(path) for path in sorted(paths, key=self._natural_key)],
+                skip_errors=True,
+                on_error=_on_error,
             )
+            if not imported and errors:
+                raise OSError("；".join(errors[:5]))
+            if not imported:
+                QMessageBox.information(self, "没有图片", "没有可导入的图片文件。")
+                return
             self._append_pages([str(item.page) for item in imported])
+            if errors:
+                self._log(f"⚠️ 部分图片导入失败：{'；'.join(errors[:5])}")
         except OSError as exc:
             self._log(f"❌ 图片导入失败：{exc}")
             QMessageBox.critical(self, "导入失败", str(exc))
 
     def _open_folder(self):
-        if self._batch_ui_running:
+        if self._batch_ui_running or (
+            self._pdf_worker and self._pdf_worker.isRunning()
+        ):
             return
         folder = QFileDialog.getExistingDirectory(self, "选择要递归导入的文件夹")
         if not folder:
             return
+        errors: list[str] = []
+
+        def _on_error(source: Path, exc: OSError) -> None:
+            errors.append(f"{source.name}: {exc}")
+
         try:
-            imported = import_folder(self.project.path, Path(folder))
+            imported = import_folder(
+                self.project.path, Path(folder), on_error=_on_error
+            )
             if not imported:
                 QMessageBox.information(
                     self, "没有图片", "文件夹及其子目录中没有支持的图片。"
                 )
                 return
             self._append_pages([str(item.page) for item in imported])
+            if errors:
+                self._log(f"⚠️ 部分图片跳过：{'；'.join(errors[:5])}")
         except OSError as exc:
             self._log(f"❌ 文件夹导入失败：{exc}")
             QMessageBox.critical(self, "导入失败", str(exc))
@@ -214,6 +258,9 @@ class ProjectEditor(legacy.MainWindow):
         if self._batch_ui_running or (
             self._pdf_worker and self._pdf_worker.isRunning()
         ):
+            return
+        if self._ocr_worker and self._ocr_worker.isRunning():
+            QMessageBox.information(self, "请稍候", "当前识别完成后再导入 PDF。")
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "选择 PDF", "", "PDF 文件 (*.pdf)"
@@ -224,10 +271,16 @@ class ProjectEditor(legacy.MainWindow):
             info = inspect_pdf(Path(path))
             if info.needs_password:
                 raise ValueError("暂不支持加密 PDF")
+            if info.page_count < 1:
+                raise ValueError("PDF 没有可导入的页面")
         except Exception as exc:
             QMessageBox.critical(self, "无法打开 PDF", str(exc))
             return
-        dialog = PDFRangeDialog(info.page_count, self.pdf_dpi, self)
+        try:
+            dialog = PDFRangeDialog(info.page_count, self.pdf_dpi, self)
+        except ValueError as exc:
+            QMessageBox.critical(self, "无法打开 PDF", str(exc))
+            return
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         total = dialog.end_page.value() - dialog.start_page.value() + 1
@@ -238,6 +291,8 @@ class ProjectEditor(legacy.MainWindow):
         self._pdf_progress.setWindowTitle("导入 PDF")
         self._pdf_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._pdf_progress.setMinimumDuration(0)
+        self._pdf_progress.setAutoClose(False)
+        self._pdf_progress.setAutoReset(False)
         self._pdf_worker = PDFImportWorker(
             self.project.path,
             Path(path),
@@ -250,6 +305,7 @@ class ProjectEditor(legacy.MainWindow):
         self._pdf_worker.succeeded.connect(self._on_pdf_succeeded)
         self._pdf_worker.failed.connect(self._on_pdf_failed)
         self._pdf_worker.finished.connect(self._on_pdf_finished)
+        self._set_import_busy(True)
         self._pdf_worker.start()
 
     def _on_pdf_progress(self, current: int, total: int, path: str) -> None:
@@ -275,11 +331,71 @@ class ProjectEditor(legacy.MainWindow):
         if self._pdf_worker:
             self._pdf_worker.deleteLater()
             self._pdf_worker = None
+        self._set_import_busy(False)
+
+    def _set_import_busy(self, busy: bool) -> None:
+        """Disable queue-mutating actions while PDF import is running."""
+        if hasattr(self, "_act_pdf"):
+            self._act_pdf.setEnabled(not busy and not self._batch_ui_running)
+        self._act_open_files.setEnabled(not busy and not self._batch_ui_running)
+        self._act_open_folder.setEnabled(not busy and not self._batch_ui_running)
+        self._act_batch_ocr.setEnabled(
+            not busy and bool(self._image_paths) and not self._batch_ui_running
+        )
+        self._update_buttons()
 
     def _open_settings(self):
-        super()._open_settings()
+        if self._batch_ui_running or (
+            self._pdf_worker and self._pdf_worker.isRunning()
+        ):
+            return
+        # Present the global default export folder in settings, not the project
+        # output path (which is fixed for project workspaces).
+        dialog_config = dict(self._config)
+        dialog_config["output_dir"] = self._global_output_dir
+        dialog = legacy.SettingsDialog(dialog_config, self)
+        if dialog.exec() != legacy.QDialog.DialogCode.Accepted:
+            return
+        new_config = dialog.get_config()
+        self._global_output_dir = new_config.get(
+            "output_dir", self._global_output_dir
+        )
+        self._config.update(new_config)
         self._config["output_dir"] = str(self.project.output_dir)
-        self._save_config()
+        self._persist_global_config()
+        self._log("⚙️ 设置已保存")
+
+    def _save_config(self):
+        """Persist API settings without writing the project path as global output_dir."""
+        self._persist_global_config()
+
+    def _persist_global_config(self) -> None:
+        import json
+
+        from ..paths import CONFIG_PATH
+
+        payload = dict(self._config)
+        payload["output_dir"] = getattr(
+            self, "_global_output_dir", self._config.get("output_dir", "")
+        )
+        # Runtime always targets the current project's output directory.
+        self._config["output_dir"] = str(self.project.output_dir)
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(CONFIG_PATH)
+        except Exception as exc:
+            self._log(f"⚠️ 保存配置失败: {exc}")
+
+    def _set_batch_ui_running(self, running: bool):
+        super()._set_batch_ui_running(running)
+        if hasattr(self, "_act_pdf"):
+            pdf_busy = bool(self._pdf_worker and self._pdf_worker.isRunning())
+            self._act_pdf.setEnabled(not running and not pdf_busy)
 
     def closeEvent(self, event):
         if self._pdf_worker and self._pdf_worker.isRunning():
@@ -295,6 +411,7 @@ class ProjectEditor(legacy.MainWindow):
                 self.project = self.store.touch(self.project)
             except OSError:
                 self._log(traceback.format_exc())
+            # Never destroy the window from close; return to project list instead.
             event.ignore()
             self.hide()
             self.back_requested.emit()

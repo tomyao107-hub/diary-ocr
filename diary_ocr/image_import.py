@@ -36,8 +36,15 @@ def unique_path(directory: Path, name: str) -> Path:
 
 def _copy_atomic(source: Path, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
-    shutil.copy2(source, temporary)
-    temporary.replace(destination)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass(frozen=True)
@@ -64,7 +71,13 @@ def discover_images(folder: Path) -> list[Path]:
     return sorted(discovered, key=natural_key)
 
 
-def import_images(project_root: Path, paths: Iterable[Path]) -> list[ImportedPage]:
+def import_images(
+    project_root: Path,
+    paths: Iterable[Path],
+    *,
+    skip_errors: bool = False,
+    on_error=None,
+) -> list[ImportedPage]:
     project_root = Path(project_root).resolve()
     sources_dir = project_root / "sources"
     pages_dir = project_root / "pages"
@@ -72,21 +85,51 @@ def import_images(project_root: Path, paths: Iterable[Path]) -> list[ImportedPag
     pages_dir.mkdir(parents=True, exist_ok=True)
     imported = []
     for raw_path in paths:
-        source = Path(raw_path).resolve()
+        try:
+            source = Path(raw_path).resolve()
+        except (OSError, RuntimeError):
+            continue
         if not source.is_file() or source.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
+        # Avoid re-importing a file that already lives under this project tree.
+        try:
+            source.relative_to(project_root)
+            already_in_project = True
+        except ValueError:
+            already_in_project = False
+        if already_in_project:
+            # If the source is already a project page, just keep using it.
+            if source.parent.resolve() == pages_dir.resolve():
+                imported.append(ImportedPage(source, source))
+                continue
         source_copy = unique_path(sources_dir, source.name)
         page_copy = unique_path(pages_dir, source.name)
         try:
             _copy_atomic(source, source_copy)
             _copy_atomic(source, page_copy)
-        except OSError:
+        except OSError as exc:
             source_copy.unlink(missing_ok=True)
             page_copy.unlink(missing_ok=True)
+            if on_error is not None:
+                on_error(source, exc)
+            if skip_errors:
+                continue
             raise
         imported.append(ImportedPage(source_copy, page_copy))
     return imported
 
 
-def import_folder(project_root: Path, folder: Path) -> list[ImportedPage]:
-    return import_images(project_root, discover_images(folder))
+def import_folder(
+    project_root: Path,
+    folder: Path,
+    *,
+    on_error=None,
+) -> list[ImportedPage]:
+    # Folder imports tolerate individual unreadable files so one locked image
+    # does not abort the whole batch.
+    return import_images(
+        project_root,
+        discover_images(folder),
+        skip_errors=True,
+        on_error=on_error,
+    )

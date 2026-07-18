@@ -108,6 +108,9 @@ class ProjectHome(QMainWindow):
         name, accepted = QInputDialog.getText(self, "新建项目", "项目名称")
         if not accepted:
             return
+        if not name.strip():
+            QMessageBox.warning(self, "创建失败", "项目名称不能为空。")
+            return
         try:
             project = self.store.create(name)
         except (OSError, ValueError) as exc:
@@ -155,7 +158,10 @@ class ProjectHome(QMainWindow):
         dialog = legacy.SettingsDialog(self.config, self)
         if dialog.exec() == legacy.QDialog.DialogCode.Accepted:
             self.config.update(dialog.get_config())
-            save_global_config(self.config)
+            try:
+                save_global_config(self.config)
+            except OSError as exc:
+                QMessageBox.warning(self, "保存失败", f"无法写入全局配置：{exc}")
 
     def _choose_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -163,7 +169,16 @@ class ProjectHome(QMainWindow):
         )
         if not selected:
             return
-        self.config["projects_root"] = str(Path(selected).resolve())
-        save_global_config(self.config)
-        self.root_changed.emit(self.config["projects_root"])
+        try:
+            resolved = str(Path(selected).expanduser().resolve())
+        except (OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "无效目录", str(exc))
+            return
+        self.config["projects_root"] = resolved
+        try:
+            save_global_config(self.config)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", f"无法写入全局配置：{exc}")
+            return
+        self.root_changed.emit(resolved)
 
