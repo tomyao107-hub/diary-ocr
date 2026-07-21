@@ -70,14 +70,14 @@ from PyQt6.QtWidgets import (
     QFormLayout, QLineEdit, QDialogButtonBox, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QScrollArea, QFrame, QProgressBar,
     QSizePolicy, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QPlainTextEdit, QToolButton, QSpinBox, QDoubleSpinBox,
+    QGraphicsPolygonItem, QPlainTextEdit, QToolButton, QSpinBox, QDoubleSpinBox,
     QGroupBox, QCheckBox, QListWidget, QListWidgetItem,
     QTabWidget, QComboBox,
 )
 from PyQt6.QtGui import (
     QPixmap, QImage, QImageReader, QAction, QIcon, QFont, QKeySequence,
     QTransform, QColor, QPalette, QWheelEvent, QMouseEvent,
-    QPainter, QBrush, QPen,
+    QPainter, QBrush, QPen, QPolygonF,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QRectF, QPointF,
@@ -834,9 +834,12 @@ class BatchOCRWorker(QThread):
     def stop(self):
         self._stop.set()
 
-    def _recognize_bytes(self, jpeg_bytes: bytes) -> str:
+    def _recognize_bytes(self, jpeg_bytes: bytes, path: str = "") -> str:
         if self.recognize_fn is not None:
-            return self.recognize_fn(jpeg_bytes)
+            try:
+                return self.recognize_fn(jpeg_bytes, path)
+            except TypeError:
+                return self.recognize_fn(jpeg_bytes)
         return self.api_client.recognize(jpeg_bytes)
 
     def _process_one(self, index: int, path: str) -> tuple[int, str, str, int]:
@@ -865,7 +868,7 @@ class BatchOCRWorker(QThread):
             if self._stop.is_set():
                 raise CancelledError()
             try:
-                text = self._recognize_bytes(jpeg_bytes)
+                text = self._recognize_bytes(jpeg_bytes, path)
                 last_error = None
                 break
             except Exception as exc:
@@ -986,6 +989,7 @@ class ZoomableImageViewer(QGraphicsView):
       - Ctrl+= / Ctrl+- / Ctrl+0 键盘快捷键
       - 支持自适应窗口大小（首次加载 fit）
       - 显示当前缩放比例
+      - OCR 文字框叠加（scene 坐标，随缩放同步）
     """
 
     zoom_changed = pyqtSignal(float)   # 缩放变化信号，携带缩放倍数
@@ -1000,6 +1004,10 @@ class ZoomableImageViewer(QGraphicsView):
         self.setScene(self._scene)
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._zoom_level = 1.0
+        self._box_items: list[QGraphicsPolygonItem] = []
+        self._boxes_visible = True
+        self._pending_boxes: list[dict] | None = None
+        self._pending_ocr_size: tuple[int, int] | None = None
 
         # 渲染质量
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1047,6 +1055,9 @@ class ZoomableImageViewer(QGraphicsView):
         self._load_qimage(reader.read())
 
     def clear_image(self):
+        self._box_items.clear()
+        self._pending_boxes = None
+        self._pending_ocr_size = None
         self._scene.clear()
         self._pixmap_item = None
         self._placeholder = self._scene.addText("← 在左侧文件列表选择图片")
@@ -1054,6 +1065,39 @@ class ZoomableImageViewer(QGraphicsView):
         font = QFont()
         font.setPointSize(16)
         self._placeholder.setFont(font)
+
+    def set_boxes_visible(self, visible: bool):
+        self._boxes_visible = bool(visible)
+        for item in self._box_items:
+            item.setVisible(self._boxes_visible)
+
+    def clear_ocr_boxes(self):
+        for item in self._box_items:
+            self._scene.removeItem(item)
+        self._box_items.clear()
+        self._pending_boxes = None
+        self._pending_ocr_size = None
+
+    def set_ocr_boxes(
+        self,
+        boxes: list[dict] | None,
+        ocr_size: tuple[int, int] | None = None,
+    ):
+        """
+        Overlay OCR quads. ``boxes`` items: {text, score, box:[[x,y]*4]}
+        in OCR input pixel coordinates; scaled to current pixmap size.
+        """
+        self._pending_boxes = list(boxes or [])
+        self._pending_ocr_size = ocr_size
+        self._redraw_boxes()
+
+    def preview_size(self) -> tuple[int, int] | None:
+        if self._pixmap_item is None:
+            return None
+        pix = self._pixmap_item.pixmap()
+        if pix.isNull():
+            return None
+        return (pix.width(), pix.height())
 
     def fit_in_view(self):
         """缩放至适应视口"""
@@ -1077,7 +1121,11 @@ class ZoomableImageViewer(QGraphicsView):
     def _load_qimage(self, qimg: QImage):
         if qimg.isNull():
             return
+        # Preserve pending boxes across image reload for the same page.
+        pending = self._pending_boxes
+        ocr_size = self._pending_ocr_size
         self._scene.clear()
+        self._box_items.clear()
         pixmap = QPixmap.fromImage(qimg)
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._pixmap_item.setTransformationMode(
@@ -1085,6 +1133,50 @@ class ZoomableImageViewer(QGraphicsView):
         )
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.fit_in_view()
+        self._pending_boxes = pending
+        self._pending_ocr_size = ocr_size
+        if pending:
+            self._redraw_boxes()
+
+    def _redraw_boxes(self):
+        # Remove old box items only (keep pixmap).
+        for item in self._box_items:
+            self._scene.removeItem(item)
+        self._box_items.clear()
+        if not self._pending_boxes or self._pixmap_item is None:
+            return
+        try:
+            from diary_ocr.geometry import map_boxes
+        except ImportError:
+            from .geometry import map_boxes  # type: ignore
+
+        preview = self.preview_size()
+        mapped = map_boxes(self._pending_boxes, self._pending_ocr_size, preview)
+        for entry in mapped:
+            points = entry.get("box") or []
+            if len(points) < 4:
+                continue
+            poly = QPolygonF([QPointF(float(x), float(y)) for x, y in points[:4]])
+            item = QGraphicsPolygonItem(poly)
+            score = float(entry.get("score", 1.0) or 1.0)
+            if score < 0.8:
+                pen = QPen(QColor("#f9e2af"), 2.0)
+                brush = QBrush(QColor(249, 226, 175, 40))
+            else:
+                pen = QPen(QColor("#89b4fa"), 2.0)
+                brush = QBrush(QColor(137, 180, 250, 35))
+            pen.setCosmetic(True)  # constant screen width while zooming
+            item.setPen(pen)
+            item.setBrush(brush)
+            item.setZValue(10)
+            tip = entry.get("text") or ""
+            if tip:
+                item.setToolTip(f"{tip}\n置信度 {score:.2f}")
+            else:
+                item.setToolTip(f"置信度 {score:.2f}")
+            item.setVisible(self._boxes_visible)
+            self._scene.addItem(item)
+            self._box_items.append(item)
 
     def _apply_zoom(self, factor: float):
         new_zoom = self._zoom_level * factor
@@ -1787,6 +1879,10 @@ class MainWindow(QMainWindow):
         self._batch_worker: BatchOCRWorker | None = None
         self._preview_workers: set[PreviewLoadWorker] = set()
         self._batch_ui_running = False
+        # OCR box overlay cache: canonical path → {boxes, ocr_size}
+        self._ocr_box_cache: dict[str, dict] = {}
+        self._ocr_box_cache_lock = threading.Lock()
+        self._show_ocr_boxes = True
 
         # 进度会话
         self._session = SessionManager()
@@ -1973,7 +2069,21 @@ class MainWindow(QMainWindow):
         btn_zoom_fit.setToolTip("适应窗口 (双击图片)")
         btn_zoom_fit.clicked.connect(lambda: self._viewer.fit_in_view())
 
-        for w in [self._lbl_filename, None, btn_zoom_out, self._lbl_zoom, btn_zoom_in, btn_zoom_fit]:
+        self._chk_show_boxes = QCheckBox("文字框")
+        self._chk_show_boxes.setChecked(True)
+        self._chk_show_boxes.setToolTip("在预览图上叠加 OCR 检测框（本地 Paddle）")
+        self._chk_show_boxes.setStyleSheet("color:#cdd6f4; font-size:12px;")
+        self._chk_show_boxes.toggled.connect(self._on_toggle_ocr_boxes)
+
+        for w in [
+            self._lbl_filename,
+            None,
+            self._chk_show_boxes,
+            btn_zoom_out,
+            self._lbl_zoom,
+            btn_zoom_in,
+            btn_zoom_fit,
+        ]:
             if w is None:
                 viewer_toolbar.addStretch()
             else:
@@ -2237,6 +2347,9 @@ class MainWindow(QMainWindow):
         if index not in self._ocr_texts:
             self._try_load_md(index, path)
 
+        # OCR 文字框：有缓存则叠加（预览加载完成后仍会重绘）
+        self._apply_boxes_for_path(path)
+
         # 更新状态
         total = len(self._image_paths)
         self._lbl_page.setText(f"第 {index+1} / {total} 张")
@@ -2259,12 +2372,16 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_preview_loaded(self, path: str, image: QImage):
-        if (
+        # Only apply if this preview still matches the current page.
+        if not (
             0 <= self._current_index < len(self._image_paths)
             and _canonical_path(self._image_paths[self._current_index])
             == _canonical_path(path)
         ):
-            self._viewer.load_qimage(image)
+            return
+        self._viewer.load_qimage(image)
+        # Re-map boxes onto the freshly loaded preview pixmap size.
+        self._apply_boxes_for_path(path)
 
     def _try_load_md(self, index: int, path: str):
         """尝试从同名 .md 文件加载已保存文本"""
@@ -2549,15 +2666,19 @@ class MainWindow(QMainWindow):
         self._set_status("正在压缩图片并调用 OCR…")
 
         # Route through HybridRouter so local Paddle works without cloud client.
+        path = self._image_paths[self._current_index]
+
         class _EngineClient:
-            def __init__(self, outer):
+            def __init__(self, outer, image_path: str):
                 self._outer = outer
+                self._image_path = image_path
 
             def recognize(self, jpeg_bytes: bytes) -> str:
-                return self._outer._engine_recognize(jpeg_bytes)
+                return self._outer._engine_recognize(
+                    jpeg_bytes, source_path=self._image_path
+                )
 
-        path = self._image_paths[self._current_index]
-        self._ocr_worker = OCRWorker(path, _EngineClient(self))
+        self._ocr_worker = OCRWorker(path, _EngineClient(self, path))
         self._ocr_worker.compress_done.connect(self._on_compress_done)
         self._ocr_worker.ocr_done.connect(self._on_ocr_done)
         self._ocr_worker.error.connect(self._on_ocr_error)
@@ -2589,7 +2710,18 @@ class MainWindow(QMainWindow):
         self._mark_item_done(index)
         if index == self._current_index:
             self._text_editor.setPlainText(text)
-            self._set_status("✅ 识别完成，请在右侧校对文本后点击「保存并下一张」")
+            self._apply_boxes_for_path(path)
+            box_n = 0
+            with self._ocr_box_cache_lock:
+                entry = self._ocr_box_cache.get(target_key)
+                if entry:
+                    box_n = len(entry.get("boxes") or [])
+            if box_n:
+                self._set_status(
+                    f"✅ 识别完成（{box_n} 个文字框），请校对后点击「保存并下一张」"
+                )
+            else:
+                self._set_status("✅ 识别完成，请在右侧校对文本后点击「保存并下一张」")
         else:
             self._set_status(f"✅ {Path(path).name} 识别完成")
         self._log(f"✅ OCR 成功，识别字符数：{len(text)}")
@@ -2834,6 +2966,7 @@ class MainWindow(QMainWindow):
             pass
         if current_index == self._current_index:
             self._text_editor.setPlainText(text)
+            self._apply_boxes_for_path(path)
         self._session_save_silent()
 
     def _on_batch_finished(self, summary: dict):
@@ -3167,7 +3300,9 @@ class MainWindow(QMainWindow):
 
     # ── 设置 ─────────────────────────────────────────────────────────────────
 
-    def _engine_recognize(self, jpeg_bytes: bytes) -> str:
+    def _engine_recognize(
+        self, jpeg_bytes: bytes, source_path: str | None = None
+    ) -> str:
         """Route recognition through engine registry / hybrid router (v1.5 / v2.0)."""
         from diary_ocr.engines.base import OCROptions
         from diary_ocr.engines.registry import HybridRouter, default_registry
@@ -3190,7 +3325,7 @@ class MainWindow(QMainWindow):
         )
         router = HybridRouter(
             registry,
-            mode=getattr(self, "_ocr_mode", self._config.get("ocr_mode", "cloud")),
+            mode=getattr(self, "_ocr_mode", self._config.get("ocr_mode", "local")),
             privacy_local_only=bool(
                 getattr(self, "_privacy_local_only", False)
                 or self._config.get("privacy_local_only", False)
@@ -3200,7 +3335,6 @@ class MainWindow(QMainWindow):
         # For hybrid cloud fallback during batch, treat as pre-confirmed only in pure cloud mode.
         cloud_confirmed = router.mode == "cloud"
         if router.mode == "hybrid":
-            # First try local/hybrid path; PermissionError means need confirm — re-raise as clear error.
             cloud_confirmed = False
         result = router.recognize(
             jpeg_bytes,
@@ -3213,7 +3347,47 @@ class MainWindow(QMainWindow):
             cloud_confirmed=cloud_confirmed or router.mode != "hybrid",
         )
         self._last_ocr_result = result
+        # Cache geometry for preview overlay (keyed by source page path).
+        if source_path:
+            ocr_size = result.image_size
+            if ocr_size is None:
+                try:
+                    from PIL import Image
+
+                    with Image.open(io.BytesIO(jpeg_bytes)) as pil:
+                        ocr_size = (int(pil.width), int(pil.height))
+                except Exception:
+                    ocr_size = None
+            key = _canonical_path(source_path)
+            with self._ocr_box_cache_lock:
+                self._ocr_box_cache[key] = {
+                    "boxes": list(result.boxes or []),
+                    "ocr_size": ocr_size,
+                }
         return result.text
+
+    def _on_toggle_ocr_boxes(self, checked: bool):
+        self._show_ocr_boxes = bool(checked)
+        if hasattr(self, "_viewer"):
+            self._viewer.set_boxes_visible(self._show_ocr_boxes)
+
+    def _apply_boxes_for_path(self, path: str | None):
+        if not hasattr(self, "_viewer"):
+            return
+        if not path:
+            self._viewer.clear_ocr_boxes()
+            return
+        key = _canonical_path(path)
+        with self._ocr_box_cache_lock:
+            entry = self._ocr_box_cache.get(key)
+        if not entry or not entry.get("boxes"):
+            self._viewer.clear_ocr_boxes()
+            return
+        self._viewer.set_ocr_boxes(
+            entry.get("boxes") or [],
+            entry.get("ocr_size"),
+        )
+        self._viewer.set_boxes_visible(self._show_ocr_boxes)
 
     def _build_api_client(self) -> OCRAPIClient:
         """从当前配置构造 OCRAPIClient，单一工厂，避免到处散落参数。"""

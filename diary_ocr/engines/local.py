@@ -322,6 +322,7 @@ class PPOCRLocalEngine(OCREngine):
             cancel_token.raise_if_cancelled()
 
         texts = self._extract_texts(raw)
+        boxes = self._extract_boxes(raw)
         # Diary pages: join lines top-to-bottom. PP-OCR already sorts by position.
         text = "\n".join(texts).strip()
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -329,6 +330,7 @@ class PPOCRLocalEngine(OCREngine):
         warnings: list[str] = []
         if not text:
             warnings.append("本地 PP-OCR 未识别到文本")
+        image_size = (int(array.shape[1]), int(array.shape[0])) if array is not None else None
 
         return OCRResult(
             text=text,
@@ -337,6 +339,8 @@ class PPOCRLocalEngine(OCREngine):
             model=f"{self.ocr_version}/{self.model_size}",
             duration_ms=duration_ms,
             warnings=warnings,
+            boxes=boxes,
+            image_size=image_size,
             parameters={
                 "device": self.device,
                 "lang": self.lang,
@@ -344,6 +348,65 @@ class PPOCRLocalEngine(OCREngine):
                 "rec": rec_name,
             },
         )
+
+    @staticmethod
+    def _extract_boxes(result: Any) -> list[dict]:
+        """Best-effort box extraction from PP-OCR 2.x/3.x structures."""
+        boxes: list[dict] = []
+
+        def add_box(box, text: str = "", score: float = 1.0) -> None:
+            if box is None:
+                return
+            boxes.append({"text": text or "", "score": float(score), "box": box})
+
+        if result is None:
+            return boxes
+        pages = result if isinstance(result, (list, tuple)) else [result]
+        for page in pages:
+            if page is None:
+                continue
+            # 3.x object with rec_polys / rec_boxes
+            polys = getattr(page, "rec_polys", None) or getattr(page, "dt_polys", None)
+            texts = getattr(page, "rec_texts", None) or []
+            scores = getattr(page, "rec_scores", None) or []
+            if polys is not None:
+                for i, poly in enumerate(list(polys)):
+                    t = texts[i] if i < len(texts) else ""
+                    s = scores[i] if i < len(scores) else 1.0
+                    try:
+                        coords = [[float(p[0]), float(p[1])] for p in poly]
+                        add_box(coords, str(t) if t is not None else "", float(s))
+                    except Exception:
+                        continue
+                continue
+            if isinstance(page, dict):
+                for key in ("rec_polys", "dt_polys", "boxes"):
+                    if key in page and isinstance(page[key], list):
+                        polys = page[key]
+                        texts = page.get("rec_texts") or page.get("texts") or []
+                        scores = page.get("rec_scores") or page.get("scores") or []
+                        for i, poly in enumerate(polys):
+                            t = texts[i] if i < len(texts) else ""
+                            s = scores[i] if i < len(scores) else 1.0
+                            add_box(poly, str(t) if t is not None else "", float(s or 1.0))
+                        break
+                continue
+            # Legacy 2.x: [[box, (text, score)], ...]
+            if isinstance(page, list):
+                for item in page:
+                    try:
+                        if (
+                            isinstance(item, (list, tuple))
+                            and len(item) >= 2
+                            and isinstance(item[1], (list, tuple))
+                        ):
+                            box, payload = item[0], item[1]
+                            text = payload[0] if payload else ""
+                            score = float(payload[1]) if len(payload) > 1 else 1.0
+                            add_box(box, str(text), score)
+                    except Exception:
+                        continue
+        return boxes
 
 
 class TesseractLocalEngine(OCREngine):

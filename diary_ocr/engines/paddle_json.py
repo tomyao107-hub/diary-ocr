@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import io
 import json
 import subprocess
 import sys
@@ -192,23 +193,39 @@ class PaddleOCRJsonEngine(OCREngine):
             ) from exc
 
     @staticmethod
-    def parse_result(response: dict) -> tuple[str, list[str]]:
-        """Return (text, warnings) from engine JSON."""
+    def parse_result(response: dict) -> tuple[str, list[str], list[dict]]:
+        """Return (text, warnings, boxes) from engine JSON."""
         code = int(response.get("code", -1))
         data = response.get("data")
         warnings: list[str] = []
+        boxes: list[dict] = []
         if code == 100:
             lines: list[str] = []
             if isinstance(data, list):
                 for item in data:
-                    if isinstance(item, dict):
-                        text = item.get("text")
-                        if isinstance(text, str) and text.strip():
-                            lines.append(text.strip())
-            return "\n".join(lines), warnings
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    line = text.strip() if isinstance(text, str) else ""
+                    if line:
+                        lines.append(line)
+                    box = item.get("box")
+                    if box is not None:
+                        try:
+                            score = float(item.get("score", 1.0))
+                        except (TypeError, ValueError):
+                            score = 1.0
+                        boxes.append(
+                            {
+                                "text": line,
+                                "score": score,
+                                "box": box,
+                            }
+                        )
+            return "\n".join(lines), warnings, boxes
         if code == 101:
             warnings.append("未识别到文字")
-            return "", warnings
+            return "", warnings, []
         message = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
         raise RuntimeError(f"Paddle OCR 失败（code={code}）：{message}")
 
@@ -223,6 +240,14 @@ class PaddleOCRJsonEngine(OCREngine):
         if not image:
             raise RuntimeError("图像数据为空")
         started = time.perf_counter()
+        image_size: tuple[int, int] | None = None
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image)) as pil:
+                image_size = (int(pil.width), int(pil.height))
+        except Exception:
+            image_size = None
         b64 = base64.b64encode(image).decode("ascii")
         if cancel_token:
             cancel_token.raise_if_cancelled()
@@ -230,7 +255,7 @@ class PaddleOCRJsonEngine(OCREngine):
             response = self._run_dict_unlocked({"image_base64": b64})
         if cancel_token:
             cancel_token.raise_if_cancelled()
-        text, warnings = self.parse_result(response)
+        text, warnings, boxes = self.parse_result(response)
         duration_ms = int((time.perf_counter() - started) * 1000)
         exe = self.resolve_exe()
         return OCRResult(
@@ -240,6 +265,8 @@ class PaddleOCRJsonEngine(OCREngine):
             model="PaddleOCR-json",
             duration_ms=duration_ms,
             warnings=warnings,
+            boxes=boxes,
+            image_size=image_size,
             parameters={
                 "exe": str(exe) if exe else "",
                 "enable_mkldnn": self.enable_mkldnn,

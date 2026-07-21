@@ -16,24 +16,36 @@ from diary_ocr.paths import resolve_paddleocr_json_exe
 
 class PaddleJsonEngineTests(unittest.TestCase):
     def test_parse_result_success(self):
-        text, warnings = PaddleOCRJsonEngine.parse_result(
+        text, warnings, boxes = PaddleOCRJsonEngine.parse_result(
             {
                 "code": 100,
                 "data": [
-                    {"text": "甲", "score": 0.9, "box": []},
-                    {"text": "乙", "score": 0.8, "box": []},
+                    {
+                        "text": "甲",
+                        "score": 0.9,
+                        "box": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                    },
+                    {
+                        "text": "乙",
+                        "score": 0.8,
+                        "box": [[0, 20], [10, 20], [10, 30], [0, 30]],
+                    },
                 ],
             }
         )
         self.assertEqual(text, "甲\n乙")
         self.assertEqual(warnings, [])
+        self.assertEqual(len(boxes), 2)
+        self.assertEqual(boxes[0]["text"], "甲")
+        self.assertEqual(boxes[0]["box"][0], [0, 0])
 
     def test_parse_result_empty(self):
-        text, warnings = PaddleOCRJsonEngine.parse_result(
+        text, warnings, boxes = PaddleOCRJsonEngine.parse_result(
             {"code": 101, "data": "No text found"}
         )
         self.assertEqual(text, "")
         self.assertTrue(warnings)
+        self.assertEqual(boxes, [])
 
     def test_parse_result_error(self):
         with self.assertRaises(RuntimeError):

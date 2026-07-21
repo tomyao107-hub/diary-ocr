@@ -42,10 +42,21 @@ class OCRResult:
     created_at: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
     result_schema_version: int = 1
+    # Geometry for preview overlay (Paddle det boxes). Coordinates are in the
+    # OCR input image pixel space (same frame as image_size).
+    boxes: list[dict[str, Any]] = field(default_factory=list)
+    # (width, height) of the image bytes passed to recognize(), if known.
+    image_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if not self.created_at:
             self.created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        if self.image_size is not None and not isinstance(self.image_size, tuple):
+            try:
+                w, h = self.image_size  # type: ignore[misc]
+                self.image_size = (int(w), int(h))
+            except Exception:
+                self.image_size = None
 
     def to_dict(self) -> dict:
         return asdict(self)

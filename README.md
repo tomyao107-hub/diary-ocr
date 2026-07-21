@@ -1,4 +1,4 @@
-# Diary OCR 2.1.0
+# Diary OCR 2.1.1
 
 面向历史手写日记的**项目化** OCR 与校对工具。
 
@@ -13,7 +13,7 @@
 | 本地 Paddle | 便携默认 **PaddleOCR-json**；源码可选进程内 PP-OCRv5/v6 |
 | 云端 | 可选；混合模式先本地再云端候选 |
 | 批量 OCR | 全部 / 仅未完成 / 仅重试失败；可恢复任务队列 |
-| 校对台 | 单页识别、拖拽排序、合并 `final_diary_output.md` |
+| 校对台 | 单页识别、拖拽排序、预览叠框、合并 `final_diary_output.md` |
 | 成册导出 | Markdown / DOCX / PDF → `output/exports/` |
 | 备份 | 项目 ZIP 备份与恢复；脱敏诊断包 |
 | 安全 | API Key 优先写入 Windows 凭据管理器 |

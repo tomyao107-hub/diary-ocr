@@ -8,7 +8,11 @@ from .base import CancelToken, OCREngine, OCROptions, OCRResult
 from .cloud import CloudOCREngine
 from .local import LOCAL_ENGINE_ID, LocalOCREngine, TesseractLocalEngine
 from .mock import MockOCREngine
-from .paddle_json import PADDLE_JSON_ENGINE_ID, PaddleOCRJsonEngine
+from .paddle_json import (
+    PADDLE_JSON_ENGINE_ID,
+    PaddleOCRJsonEngine,
+    get_shared_paddle_json_engine,
+)
 
 
 @dataclass
@@ -77,9 +81,10 @@ def default_registry(
             system_prompt=system_prompt,
         )
     )
-    # Portable default (Umi-style external Paddle process).
+    # Portable default (Umi-style external Paddle process) — shared instance
+    # so batch workers reuse one long-lived OCR subprocess.
     registry.register(
-        PaddleOCRJsonEngine(
+        get_shared_paddle_json_engine(
             exe_path=paddleocr_json_path or None,
             engines_dir=engines_dir or None,
         )

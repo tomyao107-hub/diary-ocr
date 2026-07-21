@@ -67,8 +67,13 @@ class PPOCREngineTests(unittest.TestCase):
     def test_hybrid_router_prefers_ppocr_when_available(self):
         registry = default_registry(api_key="k", include_mock=False)
         local = registry.get(LOCAL_ENGINE_ID)
+        paddle_json = registry.get("paddleocr-json")
         self.assertIsNotNone(local)
-        with patch.object(local, "is_available", return_value=True):
+        # When portable engine is absent, in-process PP-OCR is selected.
+        with (
+            patch.object(paddle_json, "is_available", return_value=False),
+            patch.object(local, "is_available", return_value=True),
+        ):
             router = HybridRouter(registry, mode="local")
             decision = router.decide()
             self.assertEqual(decision.engine_id, LOCAL_ENGINE_ID)
