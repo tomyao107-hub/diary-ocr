@@ -1482,10 +1482,10 @@ class SettingsDialog(QDialog):
         # ── OCR 引擎模式 (v1.5 / v2.0) ────────────────────────────────────────
         mode_row = QHBoxLayout()
         self._ocr_mode_combo = QComboBox()
+        self._ocr_mode_combo.addItem("本地 Paddle（推荐，无需 Key）", "local")
         self._ocr_mode_combo.addItem("云端", "cloud")
-        self._ocr_mode_combo.addItem("本地 PP-OCR（CPU）", "local")
         self._ocr_mode_combo.addItem("混合（先本地后云端候选）", "hybrid")
-        saved_mode = str(self.config.get("ocr_mode", "cloud"))
+        saved_mode = str(self.config.get("ocr_mode", "local"))
         idx = max(0, self._ocr_mode_combo.findData(saved_mode))
         self._ocr_mode_combo.setCurrentIndex(idx)
         self._ocr_mode_combo.setStyleSheet(
@@ -1533,8 +1533,9 @@ class SettingsDialog(QDialog):
             "• <b>Max Tokens</b>：超出截断，长页建议调大至 8192<br>"
             "• <b>并发线程</b>：同时处理多张图片，API 有 QPS 限速时请降低<br>"
             "• <b>重试</b>：仅对限流/超时/服务端错误退避重试<br>"
-            "• <b>混合模式</b>：先本地 PP-OCR；云端上传需确认，隐私模式禁止联网<br>"
-            "• <b>本地 PP-OCR</b>：CPU 默认 v5 mobile；v6 small 更快，server/medium 更准"
+            "• <b>混合模式</b>：先本地 Paddle；云端上传需确认，隐私模式禁止联网<br>"
+            "• <b>本地 Paddle</b>：便携包用 PaddleOCR-json；开发机可另用进程内 PP-OCR v5/v6<br>"
+            "• <b>云端</b>：才需要 API Key；本地模式可不填"
         )
         hint_card.setWordWrap(True)
         hint_card.setStyleSheet(
@@ -1780,7 +1781,7 @@ class MainWindow(QMainWindow):
         self._ocr_texts: dict[int, str] = {}   # index → 内存中最新文本（含未保存草稿）
         self._done_indices: set[int]   = set() # 已写盘为 .md 的页面索引
         self._page_tasks = {}                  # canonical path → PageTask (v1.1)
-        self._ocr_mode = "cloud"               # cloud | local | hybrid (v2.0)
+        self._ocr_mode = "local"               # cloud | local | hybrid — default local Paddle
         self._privacy_local_only = False
         self._ocr_worker: OCRWorker | None   = None
         self._batch_worker: BatchOCRWorker | None = None
@@ -2095,11 +2096,13 @@ class MainWindow(QMainWindow):
             "max_tokens":    4096,
             "max_workers":   3,
             "max_attempts":  3,
-            # OCR 引擎策略 (v1.5 / v2.0)
-            "ocr_mode":      "cloud",
+            # OCR 引擎策略：默认本地 Paddle（开箱即用）
+            "ocr_mode":      "local",
             "ppocr_version": "PP-OCRv5",
             "ppocr_model_size": "mobile",
             "local_device":   "cpu",
+            "paddleocr_json_path": "",
+            "engines_dir": "",
             "privacy_local_only": False,
             # 提示词
             "system_prompt": "",
@@ -2118,7 +2121,7 @@ class MainWindow(QMainWindow):
             defaults = merge_api_key_into_config(defaults)
         except Exception:
             pass
-        self._ocr_mode = str(defaults.get("ocr_mode") or "cloud")
+        self._ocr_mode = str(defaults.get("ocr_mode") or "local")
         self._privacy_local_only = bool(defaults.get("privacy_local_only", False))
         return defaults
 
@@ -2507,9 +2510,35 @@ class MainWindow(QMainWindow):
         if self._current_index < 0:
             QMessageBox.warning(self, "提示", "请先选择一张图片。")
             return
-        if not self._config.get("api_key"):
-            QMessageBox.warning(self, "缺少 API Key", "请先在「⚙️ 设置」中配置 API Key。")
+        mode = getattr(self, "_ocr_mode", self._config.get("ocr_mode", "local"))
+        if mode == "cloud" and not self._config.get("api_key"):
+            QMessageBox.warning(self, "缺少 API Key", "云端模式请先在「⚙️ 设置」中配置 API Key。")
             return
+        if mode in ("local", "hybrid"):
+            # Reuse the same availability check as batch OCR.
+            try:
+                from diary_ocr.engines.registry import default_registry
+
+                reg = default_registry(
+                    api_key=self._config.get("api_key", ""),
+                    ocr_version=str(self._config.get("ppocr_version", "PP-OCRv5")),
+                    ppocr_model_size=str(self._config.get("ppocr_model_size", "mobile")),
+                    local_device=str(self._config.get("local_device", "cpu")),
+                    paddleocr_json_path=str(
+                        self._config.get("paddleocr_json_path", "") or ""
+                    ),
+                    engines_dir=str(self._config.get("engines_dir", "") or ""),
+                )
+                if mode == "local" and reg.pick_local() is None:
+                    QMessageBox.warning(
+                        self,
+                        "本地 Paddle OCR 不可用",
+                        "未找到本地 Paddle 引擎（PaddleOCR-json 或进程内 PP-OCR）。",
+                    )
+                    return
+            except Exception as exc:
+                QMessageBox.warning(self, "本地 OCR 不可用", str(exc))
+                return
         if self._ocr_worker and self._ocr_worker.isRunning():
             return
         if self._batch_worker and self._batch_worker.isRunning():
@@ -2517,11 +2546,18 @@ class MainWindow(QMainWindow):
 
         self._btn_ocr.setEnabled(False)
         self._btn_ocr.setText("识别中…")
-        self._set_status("正在压缩图片并调用 OCR API…")
+        self._set_status("正在压缩图片并调用 OCR…")
 
-        client = self._build_api_client()
+        # Route through HybridRouter so local Paddle works without cloud client.
+        class _EngineClient:
+            def __init__(self, outer):
+                self._outer = outer
+
+            def recognize(self, jpeg_bytes: bytes) -> str:
+                return self._outer._engine_recognize(jpeg_bytes)
+
         path = self._image_paths[self._current_index]
-        self._ocr_worker = OCRWorker(path, client)
+        self._ocr_worker = OCRWorker(path, _EngineClient(self))
         self._ocr_worker.compress_done.connect(self._on_compress_done)
         self._ocr_worker.ocr_done.connect(self._on_ocr_done)
         self._ocr_worker.error.connect(self._on_ocr_error)
@@ -2655,25 +2691,31 @@ class MainWindow(QMainWindow):
         if mode == "cloud" and not self._config.get("api_key"):
             QMessageBox.warning(self, "缺少 API Key", "请先在「⚙️ 设置」中配置 API Key。")
             return
-        if mode == "local":
+        if mode in ("local", "hybrid"):
             try:
-                from diary_ocr.engines.local import LocalOCREngine
+                from diary_ocr.engines.registry import default_registry
 
-                engine = LocalOCREngine(
+                reg = default_registry(
+                    api_key=self._config.get("api_key", ""),
                     ocr_version=str(self._config.get("ppocr_version", "PP-OCRv5")),
-                    model_size=str(self._config.get("ppocr_model_size", "mobile")),
-                    device=str(self._config.get("local_device", "cpu")),
+                    ppocr_model_size=str(self._config.get("ppocr_model_size", "mobile")),
+                    local_device=str(self._config.get("local_device", "cpu")),
+                    paddleocr_json_path=str(
+                        self._config.get("paddleocr_json_path", "") or ""
+                    ),
+                    engines_dir=str(self._config.get("engines_dir", "") or ""),
                 )
-                if not engine.is_available():
+                if reg.pick_local() is None and mode == "local":
                     QMessageBox.warning(
                         self,
-                        "本地 OCR 不可用",
-                        "未安装 PP-OCR（paddlepaddle + paddleocr）。\n\n"
-                        "CPU 安装示例：\n"
+                        "本地 Paddle OCR 不可用",
+                        "未找到可用的本地 Paddle 引擎。\n\n"
+                        "便携版：请确认 engines/PaddleOCR-json/ 目录完整。\n"
+                        "源码开发：安装进程内 PP-OCR，或下载 PaddleOCR-json。\n\n"
                         "  pip install paddlepaddle -i "
                         "https://www.paddlepaddle.org.cn/packages/stable/cpu/\n"
                         "  pip install paddleocr\n\n"
-                        "隐私模式下不会自动切换云端。",
+                        "不会自动切换云端。",
                     )
                     return
             except Exception as exc:
@@ -3141,6 +3183,10 @@ class MainWindow(QMainWindow):
             ocr_version=str(self._config.get("ppocr_version", "PP-OCRv5")),
             ppocr_model_size=str(self._config.get("ppocr_model_size", "mobile")),
             local_device=str(self._config.get("local_device", "cpu")),
+            paddleocr_json_path=str(
+                self._config.get("paddleocr_json_path", "") or ""
+            ),
+            engines_dir=str(self._config.get("engines_dir", "") or ""),
         )
         router = HybridRouter(
             registry,

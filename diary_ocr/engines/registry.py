@@ -8,6 +8,7 @@ from .base import CancelToken, OCREngine, OCROptions, OCRResult
 from .cloud import CloudOCREngine
 from .local import LOCAL_ENGINE_ID, LocalOCREngine, TesseractLocalEngine
 from .mock import MockOCREngine
+from .paddle_json import PADDLE_JSON_ENGINE_ID, PaddleOCRJsonEngine
 
 
 @dataclass
@@ -35,8 +36,12 @@ class EngineRegistry:
         return [engine for engine in self._engines.values() if engine.is_available()]
 
     def pick_local(self) -> OCREngine | None:
-        """Prefer PP-OCR, then Tesseract."""
-        for engine_id in (LOCAL_ENGINE_ID, TesseractLocalEngine.ENGINE_ID):
+        """Prefer portable PaddleOCR-json, then in-process PP-OCR, then Tesseract."""
+        for engine_id in (
+            PADDLE_JSON_ENGINE_ID,
+            LOCAL_ENGINE_ID,
+            TesseractLocalEngine.ENGINE_ID,
+        ):
             engine = self.get(engine_id)
             if engine and engine.is_available():
                 return engine
@@ -56,6 +61,8 @@ def default_registry(
     ocr_version: str = "PP-OCRv5",
     ppocr_model_size: str = "mobile",
     local_device: str = "cpu",
+    paddleocr_json_path: str = "",
+    engines_dir: str = "",
 ) -> EngineRegistry:
     registry = EngineRegistry()
     registry.register(
@@ -70,6 +77,14 @@ def default_registry(
             system_prompt=system_prompt,
         )
     )
+    # Portable default (Umi-style external Paddle process).
+    registry.register(
+        PaddleOCRJsonEngine(
+            exe_path=paddleocr_json_path or None,
+            engines_dir=engines_dir or None,
+        )
+    )
+    # In-process PP-OCR for developers with paddle installed.
     registry.register(
         LocalOCREngine(
             ocr_version=ocr_version,
@@ -85,9 +100,9 @@ def default_registry(
 
 class HybridRouter:
     """
-    Hybrid strategy (v2.0):
-      1. Prefer local (PP-OCR) when available and privacy allows.
-      2. Flag low-confidence / empty local results as cloud candidates.
+    Hybrid strategy:
+      1. Prefer local Paddle when available and privacy allows.
+      2. Flag empty local results as cloud candidates.
       3. Never send to cloud without user confirmation when hybrid+confirm.
     """
 
@@ -95,7 +110,7 @@ class HybridRouter:
         self,
         registry: EngineRegistry,
         *,
-        mode: str = "cloud",
+        mode: str = "local",
         privacy_local_only: bool = False,
         require_cloud_confirm: bool = True,
     ):
@@ -112,8 +127,8 @@ class HybridRouter:
                 f"{reason_prefix}：{local.capabilities().display_name}",
             )
         return HybridDecision(
-            LOCAL_ENGINE_ID,
-            f"{reason_prefix}：需要本地引擎，但 PP-OCR/Tesseract 均不可用",
+            PADDLE_JSON_ENGINE_ID,
+            f"{reason_prefix}：需要本地 Paddle 引擎，但当前不可用",
         )
 
     def decide(self, *, prefer_cloud: bool = False) -> HybridDecision:
@@ -121,7 +136,6 @@ class HybridRouter:
             return self._local_decision("本地/隐私模式")
         if self.mode == "cloud" or prefer_cloud:
             return HybridDecision(CloudOCREngine.ENGINE_ID, "云端模式")
-        # hybrid
         local = self.registry.pick_local()
         if local is not None:
             return HybridDecision(
@@ -156,7 +170,6 @@ class HybridRouter:
         if engine is None or not engine.is_available():
             raise RuntimeError(f"OCR 引擎不可用：{engine_id}（{decision.reason}）")
         result = engine.recognize(image, options, cancel_token)
-        # Hybrid: empty local text → mark as cloud candidate via warning.
         if (
             self.mode == "hybrid"
             and engine_id != CloudOCREngine.ENGINE_ID

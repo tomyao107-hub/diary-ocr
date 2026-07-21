@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.0 — 2026-07-21
+
+开箱即用（对齐 Umi-OCR 便携体验），**本地默认 Paddle**。
+
+- 新增 `PaddleOCRJsonEngine`：通过 `engines/PaddleOCR-json` 独立进程调用 PaddleOCR-json。
+- 本地引擎优先级：PaddleOCR-json → 进程内 PP-OCR → Tesseract。
+- 默认 `ocr_mode=local`；本地模式无需 API Key。
+- 单页/批量识别均经 HybridRouter，支持纯离线。
+- 新增 `scripts/fetch_paddleocr_json.ps1` 与 `scripts/build_windows_portable.ps1`（打包内置引擎）。
+- 启动探测本地引擎；退出时清理子进程。
+
 ## 2.0.1 — 2026-07-21
 
 - 本地 OCR 默认改为 **PP-OCRv5/v6（CPU）**，经统一 `OCREngine` 接入。

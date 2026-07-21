@@ -18,6 +18,9 @@ final_diary_output.md
 # 打包产物（Release 单独上传，不进主仓库树）
 release/
 *.zip
+vendor/
+# Portable OCR plugin tree at repo root only (not diary_ocr/engines package)
+/engines/
 
 # 编辑器 / 操作系统
 .vscode/
@@ -25,3 +28,8 @@ release/
 .DS_Store
 Thumbs.db
 .claude/
+
+# Keep the lightweight 7zr helper for packaging (small public domain binary)
+!dev-tools/
+!dev-tools/7z/
+!dev-tools/7z/7zr.exe
