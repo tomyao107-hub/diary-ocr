@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.0.1 — 2026-07-21
+
+- 本地 OCR 默认改为 **PP-OCRv5/v6（CPU）**，经统一 `OCREngine` 接入。
+- 设置页可选 PP-OCRv5 / v6 与 mobile/small、server/medium 规格。
+- Tesseract 降为可选备用引擎；隐私模式仍不会静默切云端。
+- 依赖：`paddlepaddle`（CPU 源）+ `paddleocr>=3.0`。
+
+## 2.0.0 — 2026-07-21
+
+按 `PLAN.md` 第 11 节完成 v1.1 → v2.0 能力升级。
+
+### v1.1 可靠批量 OCR
+- 会话升级为 `session.json` schema 2：每页持久化 `status` / `attempts` / `last_error` / `completed_at` / `output`
+- schema 1 自动迁移（先写 `.bak`），幂等可重复执行
+- 异常退出后 `running` 自动恢复为 `pending`
+- 批量模式：处理全部 / 仅未完成 / 仅重试失败
+- 429、超时、5xx 有上限指数退避重试；单页永久失败不阻塞其余页
+- 取消后保留已成功结果；结束时输出失败报告
+
+### v1.2 素材质量
+- SHA-256 原件去重与导入报告（成功/重复/跳过/不支持/失败）
+- `pages_meta.json` 页面元数据（来源、哈希、尺寸、预处理参数）
+- EXIF 方向修正；可选从原件重建工作页
+- HEIC/HEIF 扩展名支持（需可选依赖 `pillow-heif`）
+
+### v1.3 成册导出
+- 工具栏「成册导出」：Markdown / DOCX / PDF 写入 `output/exports/`
+- 导出前检查未完成页面；可复用 `export_profile.json`
+
+### v1.4 安全与备份
+- Windows 凭据管理器优先保存 API Key（明文 JSON 回退）
+- 项目备份 ZIP 与从备份恢复
+- 脱敏诊断包（不含 Key、不含图片与 OCR 正文）
+
+### v1.5 / v2.0 多引擎
+- 统一 `OCREngine` 接口：云端 / 本地 Tesseract / 离线 Mock
+- 设置中可选 OCR 模式：云端、本地、混合；隐私模式禁止云端上传
+- 混合模式不会在未确认时静默上传；本地不可用时明确报错
+
 ## 1.0.1 — 2026-07-18
 
 - 修复：合并输出后错误清除项目 session，导致自定义顺序与重开恢复失效。

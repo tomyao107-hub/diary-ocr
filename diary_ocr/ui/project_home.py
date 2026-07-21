@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import __version__
+from ..backup import restore_project_backup
 from ..legacy import module as legacy
 from ..paths import save_global_config
 from ..project_store import Project, ProjectStore
@@ -63,17 +64,20 @@ class ProjectHome(QMainWindow):
         open_button = QPushButton("打开")
         remove_button = QPushButton("移除 / 删除")
         remove_button.setObjectName("danger")
+        restore_button = QPushButton("从备份恢复")
         settings_button = QPushButton("OCR 设置")
         root_button = QPushButton("更改项目目录")
         new_button.clicked.connect(self._create)
         open_button.clicked.connect(self._open)
         remove_button.clicked.connect(self._remove)
+        restore_button.clicked.connect(self._restore_backup)
         settings_button.clicked.connect(self._settings)
         root_button.clicked.connect(self._choose_root)
         for button in (
             new_button,
             open_button,
             remove_button,
+            restore_button,
             settings_button,
             root_button,
         ):
@@ -154,12 +158,47 @@ class ProjectHome(QMainWindow):
             elif accepted:
                 QMessageBox.warning(self, "名称不匹配", "项目名称不匹配，未删除。")
 
+    def _restore_backup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择项目备份", "", "备份文件 (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            restored = restore_project_backup(Path(path), self.store.root)
+        except Exception as exc:
+            QMessageBox.critical(self, "恢复失败", str(exc))
+            return
+        self.refresh()
+        QMessageBox.information(
+            self, "恢复完成", f"项目已恢复到：\n{restored}\n请从列表中打开。"
+        )
+
     def _settings(self) -> None:
-        dialog = legacy.SettingsDialog(self.config, self)
+        dialog_config = dict(self.config)
+        try:
+            from ..credentials import load_api_key
+
+            if not dialog_config.get("api_key"):
+                dialog_config["api_key"] = load_api_key(dialog_config)
+        except Exception:
+            pass
+        dialog = legacy.SettingsDialog(dialog_config, self)
         if dialog.exec() == legacy.QDialog.DialogCode.Accepted:
             self.config.update(dialog.get_config())
             try:
-                save_global_config(self.config)
+                from ..credentials import load_api_key
+
+                key = load_api_key(self.config)
+                if key:
+                    self.config["api_key"] = key
+            except Exception:
+                pass
+            try:
+                payload = dict(self.config)
+                if payload.get("api_key_storage") == "windows-credential-manager":
+                    payload["api_key"] = ""
+                save_global_config(payload)
             except OSError as exc:
                 QMessageBox.warning(self, "保存失败", f"无法写入全局配置：{exc}")
 

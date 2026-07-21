@@ -1,5 +1,5 @@
-"""Diary OCR 1.0 application package."""
+"""Diary OCR application package (v2.0 multi-engine platform)."""
 
 APP_NAME = "历史日记 OCR 数字化助手"
-__version__ = "1.0.1"
+__version__ = "2.0.1"
 

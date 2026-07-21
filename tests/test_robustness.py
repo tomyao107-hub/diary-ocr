@@ -132,8 +132,9 @@ class RobustnessTests(unittest.TestCase):
             source.mkdir()
             good = source / "a.jpg"
             bad = source / "b.jpg"
+            # Distinct content so SHA-256 dedup does not skip b.jpg before copy.
             Image.new("RGB", (8, 8), "white").save(good)
-            Image.new("RGB", (8, 8), "white").save(bad)
+            Image.new("RGB", (8, 8), "black").save(bad)
             errors = []
 
             original = legacy.shutil.copy2 if hasattr(legacy, "shutil") else None

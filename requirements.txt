@@ -3,3 +3,10 @@ Pillow==12.3.0
 openai==2.45.0
 python-dotenv==1.2.2
 PyMuPDF==1.26.3
+python-docx==1.1.2
+# Local PP-OCR (CPU). Install paddlepaddle from official CPU wheel first:
+#   pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+paddleocr>=3.0.0
+# Optional: HEIC import / Tesseract fallback
+# pillow-heif>=0.16.0
+# pytesseract>=0.3.10

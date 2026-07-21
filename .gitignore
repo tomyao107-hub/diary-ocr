@@ -2,6 +2,11 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
 
 # 环境变量 / 密钥
 .env
@@ -10,8 +15,13 @@ __pycache__/
 *.tmp
 final_diary_output.md
 
+# 打包产物（Release 单独上传，不进主仓库树）
+release/
+*.zip
+
 # 编辑器 / 操作系统
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+.claude/

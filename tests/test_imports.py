@@ -17,12 +17,18 @@ class ImportTests(unittest.TestCase):
             (project / "pages").mkdir()
             external = root / "external"
             external.mkdir()
-            image = external / "page.jpg"
-            Image.new("RGB", (20, 20), "white").save(image)
+            first_src = external / "one" / "page.jpg"
+            second_src = external / "two" / "page.jpg"
+            first_src.parent.mkdir(parents=True)
+            second_src.parent.mkdir(parents=True)
+            # Different pixels so SHA-256 dedup does not collapse them.
+            Image.new("RGB", (20, 20), "white").save(first_src)
+            Image.new("RGB", (20, 20), "black").save(second_src)
 
-            first = import_images(project, [image])[0]
-            second = import_images(project, [image])[0]
-            image.unlink()
+            first = import_images(project, [first_src])[0]
+            second = import_images(project, [second_src])[0]
+            first_src.unlink()
+            second_src.unlink()
 
             self.assertTrue(first.source.exists())
             self.assertTrue(first.page.exists())
@@ -35,9 +41,15 @@ class ImportTests(unittest.TestCase):
             project = root / "project"
             source = root / "source"
             (source / "nested").mkdir(parents=True)
-            for relative in ("nested/page10.png", "nested/page2.png", "page1.png"):
+            colors = {
+                "nested/page10.png": "red",
+                "nested/page2.png": "green",
+                "page1.png": "blue",
+            }
+            for relative, color in colors.items():
                 path = source / relative
-                Image.new("RGB", (10, 10), "white").save(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (10, 10), color).save(path)
 
             imported = import_folder(project, source)
             self.assertEqual(

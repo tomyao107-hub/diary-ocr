@@ -28,7 +28,13 @@ class ProjectSessionTests(unittest.TestCase):
                 )
             )
             raw = json.loads(session.path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["pages"], ["pages/a.jpg", "pages/b.jpg"])
+            self.assertEqual(raw["schema_version"], 2)
+            self.assertEqual(
+                [item["path"] for item in raw["pages"]],
+                ["pages/a.jpg", "pages/b.jpg"],
+            )
+            self.assertEqual(raw["pages"][0]["status"], "succeeded")
+            self.assertEqual(raw["pages"][1]["status"], "pending")
             self.assertNotIn(str(original), session.path.read_text(encoding="utf-8"))
 
             moved = root / "moved"

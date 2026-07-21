@@ -330,6 +330,7 @@ class SessionManager:
         output_dir: str,
         done_indices: set[int],
         draft_texts: dict[int, str],
+        **_kwargs,
     ) -> bool:
         """
         将会话状态序列化并原子写入磁盘。
@@ -598,7 +599,7 @@ class ImageCompressor:
 # ─────────────────────────────────────────────────────────────────────────────
 class OCRAPIClient:
     """
-    封装阿里百炼 Qwen-VL-OCR API 调用（openai SDK 兼容接口）。
+    云端 OCR 客户端。内部委托统一 OCREngine（v1.5），保持旧调用方兼容。
 
     参数说明：
       api_key       : 阿里百炼 API Key（必填）
@@ -623,6 +624,7 @@ class OCRAPIClient:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         timeout: float = API_TIMEOUT_SECONDS,
+        engine=None,
     ):
         self.api_key       = api_key
         self.base_url      = base_url.rstrip("/") or self.DEFAULT_BASE_URL
@@ -632,59 +634,51 @@ class OCRAPIClient:
         self.temperature   = max(0.0, min(2.0, float(temperature)))
         self.max_tokens    = max(1, int(max_tokens))
         self.timeout       = max(1.0, float(timeout))
+        self._engine = engine
+        self.last_result = None
+
+    def _get_engine(self):
+        if self._engine is not None:
+            return self._engine
+        try:
+            from .engines.cloud import CloudOCREngine
+        except ImportError:
+            from diary_ocr.engines.cloud import CloudOCREngine
+
+        self._engine = CloudOCREngine(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+            user_prompt=self.user_prompt,
+            system_prompt=self.system_prompt,
+        )
+        return self._engine
 
     def recognize(self, jpeg_bytes: bytes) -> str:
         """
-        同步调用 OCR API，返回识别文本字符串。
+        同步调用 OCR，返回识别文本字符串。
         必须在后台线程调用（OCRWorker / BatchOCRWorker），严禁阻塞主线程。
         """
         try:
-            from openai import OpenAI
+            from .engines.base import OCROptions
         except ImportError:
-            raise RuntimeError("请安装 openai 库：pip install openai")
+            from diary_ocr.engines.base import OCROptions
 
-        client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout,
-            max_retries=2,
+        engine = self._get_engine()
+        result = engine.recognize(
+            jpeg_bytes,
+            OCROptions(
+                user_prompt=self.user_prompt,
+                system_prompt=self.system_prompt,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            ),
         )
-
-        b64_data  = base64.b64encode(jpeg_bytes).decode("utf-8")
-        image_url = f"data:image/jpeg;base64,{b64_data}"
-
-        # 构建消息列表：system prompt 可选
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-
-        messages.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url,
-                        "min_pixels": 3072,
-                        "max_pixels": MAX_PIXELS,
-                    },
-                },
-                {"type": "text", "text": self.user_prompt},
-            ],
-        })
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
-        if not response.choices:
-            raise RuntimeError("OCR API 返回空 choices，请检查模型与配额")
-        content = response.choices[0].message.content
-        if content is None:
-            raise RuntimeError("OCR API 返回空内容，请检查模型与提示词设置")
-        return content.strip()
+        self.last_result = result
+        return result.text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -784,22 +778,27 @@ class PreviewLoadWorker(QThread):
 # ─────────────────────────────────────────────────────────────────────────────
 class BatchOCRWorker(QThread):
     """
-    批量静默处理所有图片并保存 .md 文件。
+    批量静默处理图片并保存 .md 文件（v1.1：可恢复队列 + 有限重试）。
 
     并发策略：
       使用 ThreadPoolExecutor，线程数由 max_workers 控制（默认 3）。
       每个子任务独立完成"压缩 → API 请求 → 保存"三步，互不阻塞。
       中止信号通过 _stop 标志传递；已提交的任务会完成当前步骤后退出。
+      对 429 / 超时 / 5xx 使用有上限的指数退避重试。
 
     信号：
       progress(current, total, path)   —— 每张完成或失败时发出
       item_done(index, path, text)     —— 每张成功完成时发出
+      item_started(index, path)        —— 开始处理某页
+      item_failed(index, path, msg, attempts)
       log(msg)                         —— 日志字符串
       batch_done(summary)              —— 全部完成（含中止情况）
       error(index, path, msg)          —— 单张失败时发出
     """
     progress  = pyqtSignal(int, int, str)
     item_done = pyqtSignal(int, str, str)
+    item_started = pyqtSignal(int, str)
+    item_failed = pyqtSignal(int, str, str, int)
     log       = pyqtSignal(str)
     batch_done = pyqtSignal(dict)
     error     = pyqtSignal(int, str, str)
@@ -810,21 +809,46 @@ class BatchOCRWorker(QThread):
         api_client: OCRAPIClient,
         output_dir: str,
         max_workers: int = 3,
+        jobs: list[tuple[int, str]] | None = None,
+        max_attempts: int = 3,
+        all_image_paths: list[str] | None = None,
+        recognize_fn=None,
     ):
         super().__init__()
-        self.image_paths = tuple(image_paths)
+        # jobs: optional subset of (index, path); default = all paths.
+        if jobs is None:
+            self.jobs = list(enumerate(image_paths))
+            self.image_paths = tuple(image_paths)
+        else:
+            self.jobs = list(jobs)
+            self.image_paths = tuple(
+                all_image_paths if all_image_paths is not None else image_paths
+            )
         self.api_client  = api_client
         self.output_dir  = output_dir
         self.max_workers = max(1, int(max_workers))
+        self.max_attempts = max(1, int(max_attempts))
+        self.recognize_fn = recognize_fn
         self._stop       = threading.Event()
 
     def stop(self):
         self._stop.set()
 
-    def _process_one(self, index: int, path: str) -> tuple[int, str, str]:
-        """单任务：压缩 → API → 保存，在线程池子线程内执行。"""
+    def _recognize_bytes(self, jpeg_bytes: bytes) -> str:
+        if self.recognize_fn is not None:
+            return self.recognize_fn(jpeg_bytes)
+        return self.api_client.recognize(jpeg_bytes)
+
+    def _process_one(self, index: int, path: str) -> tuple[int, str, str, int]:
+        """单任务：压缩 → API（可重试）→ 保存。返回 attempts。"""
+        try:
+            from .ocr_task import is_retryable_error, sleep_backoff
+        except ImportError:
+            from diary_ocr.ocr_task import is_retryable_error, sleep_backoff
+
         if self._stop.is_set():
             raise CancelledError()
+        self.item_started.emit(index, path)
         jpeg_bytes, info = ImageCompressor.compress(path)
         if self._stop.is_set():
             raise CancelledError()
@@ -833,27 +857,57 @@ class BatchOCRWorker(QThread):
             f"{info['original_size_human']} → {info['final_size_human']} "
             f"q={info['final_quality']} {info['scaled_resolution']}"
         )
-        text = self.api_client.recognize(jpeg_bytes)
+        last_error: Exception | None = None
+        text = ""
+        attempts = 0
+        for attempt in range(1, self.max_attempts + 1):
+            attempts = attempt
+            if self._stop.is_set():
+                raise CancelledError()
+            try:
+                text = self._recognize_bytes(jpeg_bytes)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.max_attempts or not is_retryable_error(exc):
+                    raise
+                self.log.emit(
+                    f"⏳ {Path(path).name} 第 {attempt} 次失败（可重试）："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if not sleep_backoff(attempt, stop_event=self._stop):
+                    raise CancelledError()
+        if last_error is not None:
+            raise last_error
         if self._stop.is_set():
             raise CancelledError()
         md_path = _output_path_for_image(path, self.output_dir, self.image_paths)
         _write_text_atomic(md_path, text)
-        return index, path, text
+        return index, path, text, attempts
 
     def run(self):
-        total = len(self.image_paths)
+        try:
+            from .ocr_task import BatchSummary
+        except ImportError:
+            from diary_ocr.ocr_task import BatchSummary
+
+        total = len(self.jobs)
         completed = 0
         succeeded = 0
         failed = 0
+        cancelled = 0
+        errors: list[dict] = []
         executor = None
         try:
             Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             self.log.emit(
-                f"⚡ 批量识别启动：共 {total} 张，并发线程数 = {self.max_workers}"
+                f"⚡ 批量识别启动：共 {total} 张待处理，并发线程数 = {self.max_workers}，"
+                f"单页最多重试 {self.max_attempts} 次"
             )
             executor = ThreadPoolExecutor(max_workers=self.max_workers)
             future_map = {}
-            pending = iter(enumerate(self.image_paths))
+            pending = iter(self.jobs)
 
             def submit_next() -> bool:
                 if self._stop.is_set():
@@ -874,20 +928,22 @@ class BatchOCRWorker(QThread):
                 for future in done:
                     index, path = future_map.pop(future)
                     try:
-                        result_index, result_path, text = future.result()
+                        result_index, result_path, text, attempts = future.result()
                         succeeded += 1
                         self.item_done.emit(result_index, result_path, text)
                         self.log.emit(
                             f"✅ [{succeeded}/{total}] {Path(result_path).name} 识别完成"
-                            f"（{len(text)} 字）"
+                            f"（{len(text)} 字，尝试 {attempts} 次）"
                         )
                     except CancelledError:
-                        pass
+                        cancelled += 1
                     except Exception as exc:
                         failed += 1
                         message = f"{type(exc).__name__}: {exc}"
                         self.log.emit(f"❌ {Path(path).name}: {message}")
                         self.error.emit(index, path, message)
+                        self.item_failed.emit(index, path, message, self.max_attempts)
+                        errors.append({"index": index, "path": path, "error": message})
                     completed += 1
                     self.progress.emit(completed, total, path)
                     submit_next()
@@ -901,16 +957,20 @@ class BatchOCRWorker(QThread):
             message = f"{type(exc).__name__}: {exc}"
             self.log.emit(f"❌ 批量识别初始化失败：{message}")
             self.error.emit(-1, "", message)
+            errors.append({"index": -1, "path": "", "error": message})
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
-            self.batch_done.emit({
-                "total": total,
-                "completed": completed,
-                "succeeded": succeeded,
-                "failed": failed,
-                "stopped": self._stop.is_set(),
-            })
+            summary = BatchSummary(
+                total=total,
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                cancelled=cancelled,
+                stopped=self._stop.is_set(),
+                errors=errors,
+            )
+            self.batch_done.emit(summary.to_dict())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1402,12 +1462,79 @@ class SettingsDialog(QDialog):
         workers_row.addStretch()
         form.addRow("并发线程数:", workers_row)
 
+        # ── 失败重试次数 (v1.1) ──────────────────────────────────────────────
+        attempts_row = QHBoxLayout()
+        self._attempts_spin = QSpinBox()
+        self._attempts_spin.setRange(1, 8)
+        self._attempts_spin.setValue(int(self.config.get("max_attempts", 3)))
+        self._attempts_spin.setFixedWidth(80)
+        self._attempts_spin.setStyleSheet(
+            "QSpinBox { background:#181825; color:#cdd6f4; "
+            "border:1px solid #45475a; border-radius:6px; padding:4px 8px; }"
+        )
+        attempts_hint = QLabel("  遇 429/超时/5xx 时的最大尝试次数")
+        attempts_hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        attempts_row.addWidget(self._attempts_spin)
+        attempts_row.addWidget(attempts_hint)
+        attempts_row.addStretch()
+        form.addRow("重试次数:", attempts_row)
+
+        # ── OCR 引擎模式 (v1.5 / v2.0) ────────────────────────────────────────
+        mode_row = QHBoxLayout()
+        self._ocr_mode_combo = QComboBox()
+        self._ocr_mode_combo.addItem("云端", "cloud")
+        self._ocr_mode_combo.addItem("本地 PP-OCR（CPU）", "local")
+        self._ocr_mode_combo.addItem("混合（先本地后云端候选）", "hybrid")
+        saved_mode = str(self.config.get("ocr_mode", "cloud"))
+        idx = max(0, self._ocr_mode_combo.findData(saved_mode))
+        self._ocr_mode_combo.setCurrentIndex(idx)
+        self._ocr_mode_combo.setStyleSheet(
+            "QComboBox { background:#181825; color:#cdd6f4; border:1px solid #45475a;"
+            "border-radius:6px; padding:4px 8px; }"
+        )
+        mode_row.addWidget(self._ocr_mode_combo, 1)
+        form.addRow("OCR 模式:", mode_row)
+
+        ppocr_row = QHBoxLayout()
+        self._ppocr_version_combo = QComboBox()
+        self._ppocr_version_combo.addItem("PP-OCRv5（推荐 CPU）", "PP-OCRv5")
+        self._ppocr_version_combo.addItem("PP-OCRv6（更新）", "PP-OCRv6")
+        saved_ver = str(self.config.get("ppocr_version", "PP-OCRv5"))
+        vidx = max(0, self._ppocr_version_combo.findData(saved_ver))
+        self._ppocr_version_combo.setCurrentIndex(vidx)
+        self._ppocr_version_combo.setStyleSheet(
+            "QComboBox { background:#181825; color:#cdd6f4; border:1px solid #45475a;"
+            "border-radius:6px; padding:4px 8px; }"
+        )
+        self._ppocr_size_combo = QComboBox()
+        self._ppocr_size_combo.addItem("mobile/small（快）", "mobile")
+        self._ppocr_size_combo.addItem("server/medium（更准）", "server")
+        saved_size = str(self.config.get("ppocr_model_size", "mobile"))
+        sidx = max(0, self._ppocr_size_combo.findData(saved_size))
+        if sidx < 0:
+            sidx = 0
+        self._ppocr_size_combo.setCurrentIndex(sidx)
+        self._ppocr_size_combo.setStyleSheet(
+            "QComboBox { background:#181825; color:#cdd6f4; border:1px solid #45475a;"
+            "border-radius:6px; padding:4px 8px; }"
+        )
+        ppocr_row.addWidget(self._ppocr_version_combo, 1)
+        ppocr_row.addWidget(self._ppocr_size_combo, 1)
+        form.addRow("本地 PP-OCR:", ppocr_row)
+
+        self._privacy_check = QCheckBox("隐私模式：禁止任何云端上传")
+        self._privacy_check.setChecked(bool(self.config.get("privacy_local_only", False)))
+        form.addRow("", self._privacy_check)
+
         # 参数说明卡片
         hint_card = QLabel(
             "💡  <b>参数说明</b><br>"
             "• <b>Temperature = 0</b>：完全确定性，最适合 OCR 精确识别<br>"
             "• <b>Max Tokens</b>：超出截断，长页建议调大至 8192<br>"
-            "• <b>并发线程</b>：同时处理多张图片，API 有 QPS 限速时请降低"
+            "• <b>并发线程</b>：同时处理多张图片，API 有 QPS 限速时请降低<br>"
+            "• <b>重试</b>：仅对限流/超时/服务端错误退避重试<br>"
+            "• <b>混合模式</b>：先本地 PP-OCR；云端上传需确认，隐私模式禁止联网<br>"
+            "• <b>本地 PP-OCR</b>：CPU 默认 v5 mobile；v6 small 更快，server/medium 更准"
         )
         hint_card.setWordWrap(True)
         hint_card.setStyleSheet(
@@ -1553,8 +1680,14 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "正在测试连接", "请等待连接测试结束后再保存设置。")
             return
         # 基本校验
-        if not self._api_key_edit.text().strip():
-            QMessageBox.warning(self, "提示", "API Key 不能为空。")
+        mode = "cloud"
+        if hasattr(self, "_ocr_mode_combo"):
+            mode = self._ocr_mode_combo.currentData() or "cloud"
+        privacy = bool(
+            hasattr(self, "_privacy_check") and self._privacy_check.isChecked()
+        )
+        if mode == "cloud" and not privacy and not self._api_key_edit.text().strip():
+            QMessageBox.warning(self, "提示", "云端模式下 API Key 不能为空。")
             return
         if not self._user_prompt_edit.toPlainText().strip():
             QMessageBox.warning(self, "提示", "User Prompt 不能为空。")
@@ -1566,9 +1699,16 @@ class SettingsDialog(QDialog):
 
     def get_config(self) -> dict:
         """返回从对话框中收集的完整配置字典。"""
+        api_key = self._api_key_edit.text().strip()
+        try:
+            from diary_ocr.credentials import save_api_key
+            storage = save_api_key(api_key)
+        except Exception:
+            storage = "config-file"
         return {
             # Tab 1
-            "api_key":    self._api_key_edit.text().strip(),
+            "api_key":    "" if storage == "windows-credential-manager" else api_key,
+            "api_key_storage": storage,
             "base_url":   self._base_url_edit.text().strip() or self._DEFAULT_BASE_URL,
             "model":      self._model_combo.currentText().strip(),
             "output_dir": self._out_dir_edit.text().strip(),
@@ -1576,6 +1716,31 @@ class SettingsDialog(QDialog):
             "temperature": round(self._temp_spin.value(), 2),
             "max_tokens":  self._max_tokens_spin.value(),
             "max_workers": self._workers_spin.value(),
+            "max_attempts": (
+                self._attempts_spin.value()
+                if hasattr(self, "_attempts_spin")
+                else int(self.config.get("max_attempts", 3))
+            ),
+            "ocr_mode": (
+                self._ocr_mode_combo.currentData()
+                if hasattr(self, "_ocr_mode_combo")
+                else self.config.get("ocr_mode", "cloud")
+            ),
+            "ppocr_version": (
+                self._ppocr_version_combo.currentData()
+                if hasattr(self, "_ppocr_version_combo")
+                else self.config.get("ppocr_version", "PP-OCRv5")
+            ),
+            "ppocr_model_size": (
+                self._ppocr_size_combo.currentData()
+                if hasattr(self, "_ppocr_size_combo")
+                else self.config.get("ppocr_model_size", "mobile")
+            ),
+            "privacy_local_only": (
+                self._privacy_check.isChecked()
+                if hasattr(self, "_privacy_check")
+                else bool(self.config.get("privacy_local_only", False))
+            ),
             # Tab 3
             "system_prompt": self._system_prompt_edit.toPlainText().strip(),
             "user_prompt":   self._user_prompt_edit.toPlainText().strip(),
@@ -1587,7 +1752,10 @@ class SettingsDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
 
-    SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+    SUPPORTED_EXTS = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp",
+        ".heic", ".heif",
+    }
 
     # ── 自然排序 key（1,2,...,10 而非 1,10,2,...）────────────────────────────
     @staticmethod
@@ -1611,6 +1779,9 @@ class MainWindow(QMainWindow):
         self._current_index: int       = -1
         self._ocr_texts: dict[int, str] = {}   # index → 内存中最新文本（含未保存草稿）
         self._done_indices: set[int]   = set() # 已写盘为 .md 的页面索引
+        self._page_tasks = {}                  # canonical path → PageTask (v1.1)
+        self._ocr_mode = "cloud"               # cloud | local | hybrid (v2.0)
+        self._privacy_local_only = False
         self._ocr_worker: OCRWorker | None   = None
         self._batch_worker: BatchOCRWorker | None = None
         self._preview_workers: set[PreviewLoadWorker] = set()
@@ -1923,6 +2094,13 @@ class MainWindow(QMainWindow):
             "temperature":   0.1,
             "max_tokens":    4096,
             "max_workers":   3,
+            "max_attempts":  3,
+            # OCR 引擎策略 (v1.5 / v2.0)
+            "ocr_mode":      "cloud",
+            "ppocr_version": "PP-OCRv5",
+            "ppocr_model_size": "mobile",
+            "local_device":   "cpu",
+            "privacy_local_only": False,
             # 提示词
             "system_prompt": "",
             "user_prompt":   DEFAULT_PROMPT,
@@ -1934,6 +2112,14 @@ class MainWindow(QMainWindow):
                 defaults.update(saved)
             except Exception:
                 pass
+        # v1.4: prefer Windows Credential Manager for API key
+        try:
+            from diary_ocr.credentials import merge_api_key_into_config
+            defaults = merge_api_key_into_config(defaults)
+        except Exception:
+            pass
+        self._ocr_mode = str(defaults.get("ocr_mode") or "cloud")
+        self._privacy_local_only = bool(defaults.get("privacy_local_only", False))
         return defaults
 
     def _save_config(self):
@@ -2418,31 +2604,113 @@ class MainWindow(QMainWindow):
 
     # ── 批量 OCR ─────────────────────────────────────────────────────────────
 
+    def _choose_batch_mode(self) -> str | None:
+        """Return all | unfinished | failed, or None if cancelled."""
+        box = QMessageBox(self)
+        box.setWindowTitle("批量识别")
+        box.setText(
+            f"当前队列共 {len(self._image_paths)} 页。\n"
+            f"结果保存至：\n{self._config.get('output_dir')}"
+        )
+        box.setInformativeText(
+            "请选择处理范围：\n"
+            "· 处理全部 — 重新识别所有页面\n"
+            "· 仅未完成 — 跳过已成功页面\n"
+            "· 仅重试失败 — 只处理失败页面"
+        )
+        all_btn = box.addButton("处理全部", QMessageBox.ButtonRole.AcceptRole)
+        unfinished_btn = box.addButton("仅未完成", QMessageBox.ButtonRole.ActionRole)
+        failed_btn = box.addButton("仅重试失败", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return "all"
+        if clicked is unfinished_btn:
+            return "unfinished"
+        if clicked is failed_btn:
+            return "failed"
+        return None
+
+    def _ensure_page_tasks(self) -> None:
+        if not hasattr(self, "_page_tasks") or self._page_tasks is None:
+            self._page_tasks = {}
+        from diary_ocr.ocr_task import PageTask, TaskStatus
+
+        for index, path in enumerate(self._image_paths):
+            key = _canonical_path(path)
+            if key not in self._page_tasks:
+                status = (
+                    TaskStatus.SUCCEEDED.value
+                    if index in self._done_indices
+                    else TaskStatus.PENDING.value
+                )
+                self._page_tasks[key] = PageTask(path=path, status=status)
+
     def _start_batch_ocr(self):
         if not self._image_paths:
             QMessageBox.information(self, "提示", "请先导入图片。")
             return
-        if not self._config.get("api_key"):
+        mode = getattr(self, "_ocr_mode", "cloud")
+        if mode == "cloud" and not self._config.get("api_key"):
             QMessageBox.warning(self, "缺少 API Key", "请先在「⚙️ 设置」中配置 API Key。")
             return
+        if mode == "local":
+            try:
+                from diary_ocr.engines.local import LocalOCREngine
+
+                engine = LocalOCREngine(
+                    ocr_version=str(self._config.get("ppocr_version", "PP-OCRv5")),
+                    model_size=str(self._config.get("ppocr_model_size", "mobile")),
+                    device=str(self._config.get("local_device", "cpu")),
+                )
+                if not engine.is_available():
+                    QMessageBox.warning(
+                        self,
+                        "本地 OCR 不可用",
+                        "未安装 PP-OCR（paddlepaddle + paddleocr）。\n\n"
+                        "CPU 安装示例：\n"
+                        "  pip install paddlepaddle -i "
+                        "https://www.paddlepaddle.org.cn/packages/stable/cpu/\n"
+                        "  pip install paddleocr\n\n"
+                        "隐私模式下不会自动切换云端。",
+                    )
+                    return
+            except Exception as exc:
+                QMessageBox.warning(self, "本地 OCR 不可用", str(exc))
+                return
         if self._batch_worker and self._batch_worker.isRunning():
             return
         if self._ocr_worker and self._ocr_worker.isRunning():
             QMessageBox.information(self, "请稍候", "当前图片识别完成后再启动批量识别。")
             return
 
-        reply = QMessageBox.question(
-            self, "批量识别确认",
-            f"将对全部 {len(self._image_paths)} 张图片进行 OCR 识别，\n"
-            f"结果自动保存至：\n{self._config.get('output_dir')}\n\n"
-            "确认开始？",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        mode_choice = self._choose_batch_mode()
+        if mode_choice is None:
+            return
+
+        try:
+            from diary_ocr.ocr_task import select_jobs
+        except ImportError:
+            select_jobs = None
+
+        self._ensure_page_tasks()
+        if select_jobs is not None:
+            jobs = select_jobs(
+                self._image_paths,
+                self._page_tasks,
+                mode_choice,
+                key_fn=_canonical_path,
+            )
+        else:
+            jobs = list(enumerate(self._image_paths))
+        if not jobs:
+            QMessageBox.information(self, "无需处理", "当前没有符合条件的页面。")
             return
 
         self._set_batch_ui_running(True)
         self._progress_bar.setVisible(True)
-        self._progress_bar.setRange(0, len(self._image_paths))
+        self._progress_bar.setRange(0, len(jobs))
         self._progress_bar.setValue(0)
 
         self._batch_worker = BatchOCRWorker(
@@ -2450,9 +2718,15 @@ class MainWindow(QMainWindow):
             self._build_api_client(),
             self._config.get("output_dir", ""),
             max_workers=int(self._config.get("max_workers", 3)),
+            jobs=jobs,
+            max_attempts=int(self._config.get("max_attempts", 3)),
+            all_image_paths=list(self._image_paths),
+            recognize_fn=getattr(self, "_engine_recognize", None),
         )
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.item_done.connect(self._on_batch_item_done)
+        self._batch_worker.item_started.connect(self._on_batch_item_started)
+        self._batch_worker.item_failed.connect(self._on_batch_item_failed)
         self._batch_worker.log.connect(self._log)
         self._batch_worker.batch_done.connect(self._on_batch_finished)
         self._batch_worker.finished.connect(self._on_batch_thread_finished)
@@ -2461,6 +2735,34 @@ class MainWindow(QMainWindow):
     def _on_batch_progress(self, current: int, total: int, path: str):
         self._progress_bar.setValue(current)
         self._set_status(f"批量识别：{current}/{total} — {Path(path).name}")
+
+    def _on_batch_item_started(self, index: int, path: str):
+        try:
+            from diary_ocr.ocr_task import PageTask, TaskStatus
+        except ImportError:
+            return
+        self._ensure_page_tasks()
+        key = _canonical_path(path)
+        task = self._page_tasks.get(key) or PageTask(path=path)
+        task.mark_running()
+        task.attempts = int(task.attempts or 0) + 1
+        self._page_tasks[key] = task
+        self._mark_item_status(index, TaskStatus.RUNNING.value)
+        self._session_save_silent()
+
+    def _on_batch_item_failed(self, index: int, path: str, message: str, attempts: int):
+        try:
+            from diary_ocr.ocr_task import PageTask, TaskStatus
+        except ImportError:
+            return
+        self._ensure_page_tasks()
+        key = _canonical_path(path)
+        task = self._page_tasks.get(key) or PageTask(path=path)
+        task.attempts = max(task.attempts, attempts)
+        task.mark_failed(message)
+        self._page_tasks[key] = task
+        self._mark_item_status(index, TaskStatus.FAILED.value)
+        self._session_save_silent()
 
     def _on_batch_item_done(self, index: int, path: str, text: str):
         target_key = _canonical_path(path)
@@ -2476,6 +2778,18 @@ class MainWindow(QMainWindow):
         self._ocr_texts[current_index] = text
         self._done_indices.add(current_index)
         self._mark_item_done(current_index)
+        try:
+            from diary_ocr.ocr_task import PageTask, TaskStatus
+            self._ensure_page_tasks()
+            task = self._page_tasks.get(target_key) or PageTask(path=path)
+            out = _output_path_for_image(
+                path, self._config.get("output_dir", ""), self._image_paths
+            )
+            task.mark_succeeded(str(out))
+            self._page_tasks[target_key] = task
+            self._mark_item_status(current_index, TaskStatus.SUCCEEDED.value)
+        except ImportError:
+            pass
         if current_index == self._current_index:
             self._text_editor.setPlainText(text)
         self._session_save_silent()
@@ -2486,16 +2800,67 @@ class MainWindow(QMainWindow):
         succeeded = summary.get("succeeded", 0)
         failed = summary.get("failed", 0)
         total = summary.get("total", 0)
+        cancelled = summary.get("cancelled", 0)
+        # Mark remaining running as cancelled/pending after stop.
+        try:
+            from diary_ocr.ocr_task import TaskStatus
+            self._ensure_page_tasks()
+            if summary.get("stopped"):
+                for index, path in enumerate(self._image_paths):
+                    key = _canonical_path(path)
+                    task = self._page_tasks.get(key)
+                    if task and task.status == TaskStatus.RUNNING.value:
+                        task.mark_cancelled()
+                        self._mark_item_status(index, TaskStatus.CANCELLED.value)
+        except ImportError:
+            pass
+        report = (
+            f"成功 {succeeded}，失败 {failed}，取消 {cancelled}，计划 {total}"
+        )
         if summary.get("stopped"):
-            self._set_status(f"⚠️ 批量识别已停止：成功 {succeeded}，失败 {failed}")
-            self._log(f"⚠️ 批量识别已停止：成功 {succeeded}/{total}，失败 {failed}")
+            self._set_status(f"⚠️ 批量识别已停止：{report}")
+            self._log(f"⚠️ 批量识别已停止：{report}")
         elif failed:
-            self._set_status(f"⚠️ 批量识别完成：成功 {succeeded}，失败 {failed}")
-            self._log(f"⚠️ 批量识别完成：成功 {succeeded}/{total}，失败 {failed}")
+            self._set_status(f"⚠️ 批量识别完成：{report}")
+            self._log(f"⚠️ 批量识别完成：{report}")
         else:
             self._set_status(f"✅ 批量识别完成：{succeeded}/{total}")
             self._log(f"✅ 批量识别全部完成：{succeeded}/{total}")
+        errors = summary.get("errors") or []
+        if errors:
+            detail = "\n".join(
+                f"· {Path(item.get('path', '')).name}: {item.get('error', '')}"
+                for item in errors[:12]
+            )
+            QMessageBox.warning(
+                self,
+                "批量识别报告",
+                f"{report}\n\n失败明细：\n{detail}",
+            )
         self._session_save_silent()
+
+    def _mark_item_status(self, index: int, status: str):
+        item = self._file_list.item(index)
+        if not item:
+            return
+        colors = {
+            "succeeded": QColor("#a6e3a1"),
+            "failed": QColor("#f38ba8"),
+            "running": QColor("#f9e2af"),
+            "cancelled": QColor("#6c7086"),
+            "pending": QColor("#cdd6f4"),
+        }
+        item.setForeground(colors.get(status, QColor("#cdd6f4")))
+        name = Path(self._image_paths[index]).name if 0 <= index < len(self._image_paths) else ""
+        prefix = {
+            "succeeded": "✓ ",
+            "failed": "✗ ",
+            "running": "… ",
+            "cancelled": "⊘ ",
+            "pending": "",
+        }.get(status, "")
+        if name:
+            item.setText(f"{prefix}{name}")
 
     def _stop_batch_ocr(self):
         if self._batch_worker:
@@ -2597,6 +2962,7 @@ class MainWindow(QMainWindow):
         """
         静默保存会话（不弹框、不改变状态栏主文本）。
         draft_texts 只存储"已识别但尚未写盘为 .md"的草稿，减少冗余。
+        ProjectSession 额外持久化 page_tasks（v1.1 任务状态）。
         """
         if not self._image_paths:
             return False
@@ -2608,12 +2974,18 @@ class MainWindow(QMainWindow):
             for idx, text in self._ocr_texts.items()
             if idx not in self._done_indices and text.strip()
         }
+        if hasattr(self, "_ensure_page_tasks"):
+            try:
+                self._ensure_page_tasks()
+            except Exception:
+                pass
         ok = self._session.save(
             image_paths=self._image_paths,
             current_index=self._current_index,
             output_dir=self._config.get("output_dir", ""),
             done_indices=self._done_indices,
             draft_texts=draft_texts,
+            page_tasks=getattr(self, "_page_tasks", None),
         )
         if ok:
             import datetime
@@ -2753,6 +3125,50 @@ class MainWindow(QMainWindow):
 
     # ── 设置 ─────────────────────────────────────────────────────────────────
 
+    def _engine_recognize(self, jpeg_bytes: bytes) -> str:
+        """Route recognition through engine registry / hybrid router (v1.5 / v2.0)."""
+        from diary_ocr.engines.base import OCROptions
+        from diary_ocr.engines.registry import HybridRouter, default_registry
+
+        registry = default_registry(
+            api_key=self._config.get("api_key", ""),
+            base_url=self._config.get("base_url", ""),
+            model=self._config.get("model", ""),
+            temperature=float(self._config.get("temperature", 0.1)),
+            max_tokens=int(self._config.get("max_tokens", 4096)),
+            user_prompt=self._config.get("user_prompt", DEFAULT_PROMPT),
+            system_prompt=self._config.get("system_prompt", ""),
+            ocr_version=str(self._config.get("ppocr_version", "PP-OCRv5")),
+            ppocr_model_size=str(self._config.get("ppocr_model_size", "mobile")),
+            local_device=str(self._config.get("local_device", "cpu")),
+        )
+        router = HybridRouter(
+            registry,
+            mode=getattr(self, "_ocr_mode", self._config.get("ocr_mode", "cloud")),
+            privacy_local_only=bool(
+                getattr(self, "_privacy_local_only", False)
+                or self._config.get("privacy_local_only", False)
+            ),
+            require_cloud_confirm=True,
+        )
+        # For hybrid cloud fallback during batch, treat as pre-confirmed only in pure cloud mode.
+        cloud_confirmed = router.mode == "cloud"
+        if router.mode == "hybrid":
+            # First try local/hybrid path; PermissionError means need confirm — re-raise as clear error.
+            cloud_confirmed = False
+        result = router.recognize(
+            jpeg_bytes,
+            OCROptions(
+                user_prompt=self._config.get("user_prompt", DEFAULT_PROMPT),
+                system_prompt=self._config.get("system_prompt", ""),
+                temperature=float(self._config.get("temperature", 0.1)),
+                max_tokens=int(self._config.get("max_tokens", 4096)),
+            ),
+            cloud_confirmed=cloud_confirmed or router.mode != "hybrid",
+        )
+        self._last_ocr_result = result
+        return result.text
+
     def _build_api_client(self) -> OCRAPIClient:
         """从当前配置构造 OCRAPIClient，单一工厂，避免到处散落参数。"""
         return OCRAPIClient(
@@ -2778,9 +3194,7 @@ class MainWindow(QMainWindow):
 
     def _mark_item_done(self, index: int):
         """将文件列表中对应条目标记为绿色（已识别/已保存）"""
-        item = self._file_list.item(index)
-        if item:
-            item.setForeground(QColor("#a6e3a1"))
+        self._mark_item_status(index, "succeeded")
 
     def _update_buttons(self):
         has_images  = bool(self._image_paths)
