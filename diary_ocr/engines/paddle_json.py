@@ -100,6 +100,15 @@ class PaddleOCRJsonEngine(OCREngine):
             proc.wait(timeout=3)
         except Exception:
             pass
+        finally:
+            # Popen does not close PIPE handles merely because the child was
+            # killed/waited; close them explicitly when recycling the engine.
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
     def _start_unlocked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -277,6 +286,7 @@ class PaddleOCRJsonEngine(OCREngine):
 
 # Process-wide singleton helpers for app shutdown.
 _shared_engine: PaddleOCRJsonEngine | None = None
+_shared_engine_config: tuple[str | None, str | None] | None = None
 _shared_lock = threading.Lock()
 
 
@@ -285,19 +295,24 @@ def get_shared_paddle_json_engine(
     exe_path: str | None = None,
     engines_dir: str | None = None,
 ) -> PaddleOCRJsonEngine:
-    global _shared_engine
+    global _shared_engine, _shared_engine_config
+    config = (exe_path or None, engines_dir or None)
     with _shared_lock:
-        if _shared_engine is None:
+        if _shared_engine is None or _shared_engine_config != config:
+            if _shared_engine is not None:
+                _shared_engine.stop()
             _shared_engine = PaddleOCRJsonEngine(
                 exe_path=exe_path,
                 engines_dir=engines_dir,
             )
+            _shared_engine_config = config
         return _shared_engine
 
 
 def shutdown_shared_paddle_json_engine() -> None:
-    global _shared_engine
+    global _shared_engine, _shared_engine_config
     with _shared_lock:
         if _shared_engine is not None:
             _shared_engine.stop()
             _shared_engine = None
+        _shared_engine_config = None

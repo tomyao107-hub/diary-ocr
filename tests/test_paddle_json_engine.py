@@ -9,12 +9,20 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from diary_ocr.engines.paddle_json import PADDLE_JSON_ENGINE_ID, PaddleOCRJsonEngine
+from diary_ocr.engines.paddle_json import (
+    PADDLE_JSON_ENGINE_ID,
+    PaddleOCRJsonEngine,
+    get_shared_paddle_json_engine,
+    shutdown_shared_paddle_json_engine,
+)
 from diary_ocr.engines.registry import HybridRouter, default_registry
 from diary_ocr.paths import resolve_paddleocr_json_exe
 
 
 class PaddleJsonEngineTests(unittest.TestCase):
+    def tearDown(self):
+        shutdown_shared_paddle_json_engine()
+
     def test_parse_result_success(self):
         text, warnings, boxes = PaddleOCRJsonEngine.parse_result(
             {
@@ -60,6 +68,28 @@ class PaddleJsonEngineTests(unittest.TestCase):
             exe.write_bytes(b"fake")
             found = resolve_paddleocr_json_exe(engines_dir=str(root / "engines"))
             self.assertEqual(found, exe.resolve())
+
+    def test_shared_engine_reloads_when_its_path_configuration_changes(self):
+        first = get_shared_paddle_json_engine(exe_path="first.exe")
+        same = get_shared_paddle_json_engine(exe_path="first.exe")
+        second = get_shared_paddle_json_engine(exe_path="second.exe")
+
+        self.assertIs(first, same)
+        self.assertIsNot(first, second)
+
+    def test_stop_closes_subprocess_pipe_handles(self):
+        engine = PaddleOCRJsonEngine()
+        proc = MagicMock()
+        proc.poll.return_value = None
+        engine._proc = proc
+
+        engine.stop()
+
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=3)
+        proc.stdin.close.assert_called_once_with()
+        proc.stdout.close.assert_called_once_with()
+        proc.stderr.close.assert_called_once_with()
 
     def test_pick_local_prefers_paddle_json(self):
         registry = default_registry(api_key="k")

@@ -22,6 +22,7 @@ import io
 import json
 import base64
 import hashlib
+import inspect
 import importlib.util
 import subprocess
 import threading
@@ -829,17 +830,28 @@ class BatchOCRWorker(QThread):
         self.max_workers = max(1, int(max_workers))
         self.max_attempts = max(1, int(max_attempts))
         self.recognize_fn = recognize_fn
+        self._recognize_fn_accepts_path = self._callback_accepts_path(recognize_fn)
         self._stop       = threading.Event()
 
     def stop(self):
         self._stop.set()
 
+    @staticmethod
+    def _callback_accepts_path(callback) -> bool:
+        """Return whether a recognition callback accepts ``(bytes, path)``."""
+        if callback is None:
+            return False
+        try:
+            inspect.signature(callback).bind(b"", "")
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def _recognize_bytes(self, jpeg_bytes: bytes, path: str = "") -> str:
         if self.recognize_fn is not None:
-            try:
+            if self._recognize_fn_accepts_path:
                 return self.recognize_fn(jpeg_bytes, path)
-            except TypeError:
-                return self.recognize_fn(jpeg_bytes)
+            return self.recognize_fn(jpeg_bytes)
         return self.api_client.recognize(jpeg_bytes)
 
     def _process_one(self, index: int, path: str) -> tuple[int, str, str, int]:
@@ -2337,6 +2349,9 @@ class MainWindow(QMainWindow):
         self._file_list.blockSignals(False)
 
         # 后台解码限尺寸预览，避免大图切换阻塞主线程。
+        # Clear the previous page immediately so its image is never shown with
+        # the newly selected page's OCR boxes while decoding is in flight.
+        self._viewer.clear_image()
         self._load_preview(path)
         self._lbl_filename.setText(Path(path).name)
 

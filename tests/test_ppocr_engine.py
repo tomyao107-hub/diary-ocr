@@ -5,6 +5,8 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
@@ -51,6 +53,41 @@ class PPOCREngineTests(unittest.TestCase):
         ]
         lines = PPOCRLocalEngine._extract_texts(legacy)
         self.assertEqual(lines, ["你好"])
+
+        boxes = PPOCRLocalEngine._extract_boxes(legacy)
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["text"], "你好")
+        self.assertEqual(boxes[0]["box"], legacy[0][0])
+
+    def test_extract_numpy_boxes_from_v3_result(self):
+        page = FakePageResult(np.array(["甲"], dtype=object))
+        page.rec_polys = np.array(
+            [[[0, 0], [10, 0], [10, 5], [0, 5]]], dtype=np.float32
+        )
+        page.rec_scores = np.array([0.9], dtype=np.float32)
+
+        self.assertEqual(PPOCRLocalEngine._extract_texts([page]), ["甲"])
+        boxes = PPOCRLocalEngine._extract_boxes([page])
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0]["text"], "甲")
+        self.assertAlmostEqual(boxes[0]["score"], 0.9, places=5)
+        self.assertEqual(boxes[0]["box"][2], [10.0, 5.0])
+
+    def test_extract_boxes_from_nested_json_result(self):
+        page = MagicMock(spec=[])
+        page.json = {
+            "res": {
+                "rec_texts": ["乙"],
+                "rec_scores": [0.8],
+                "rec_polys": [[[1, 2], [3, 2], [3, 4], [1, 4]]],
+            }
+        }
+
+        boxes = PPOCRLocalEngine._extract_boxes([page])
+
+        self.assertEqual(boxes[0]["text"], "乙")
+        self.assertEqual(boxes[0]["box"][0], [1.0, 2.0])
 
     def test_recognize_uses_predict_and_joins_lines(self):
         engine = PPOCRLocalEngine(ocr_version="PP-OCRv5", model_size="mobile")

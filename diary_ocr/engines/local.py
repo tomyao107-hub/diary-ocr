@@ -249,8 +249,8 @@ class PPOCRLocalEngine(OCREngine):
             if page is None:
                 continue
             if hasattr(page, "rec_texts"):
-                texts = getattr(page, "rec_texts") or []
-                for item in texts:
+                texts = getattr(page, "rec_texts", None)
+                for item in [] if texts is None else texts:
                     if isinstance(item, str) and item.strip():
                         lines.append(item.strip())
                 continue
@@ -357,7 +357,66 @@ class PPOCRLocalEngine(OCREngine):
         def add_box(box, text: str = "", score: float = 1.0) -> None:
             if box is None:
                 return
-            boxes.append({"text": text or "", "score": float(score), "box": box})
+            try:
+                numeric_score = float(score)
+            except (TypeError, ValueError):
+                numeric_score = 1.0
+            boxes.append({"text": text or "", "score": numeric_score, "box": box})
+
+        def as_list(value: Any) -> list:
+            if value is None:
+                return []
+            if isinstance(value, list):
+                return value
+            if isinstance(value, (str, bytes, bytearray, dict)):
+                return []
+            try:
+                return list(value)
+            except (TypeError, ValueError):
+                return []
+
+        def first_value(data: Any, *keys: str) -> Any:
+            for key in keys:
+                if isinstance(data, dict):
+                    value = data.get(key)
+                else:
+                    value = getattr(data, key, None)
+                if value is not None:
+                    return value
+            return None
+
+        def add_components(data: Any) -> bool:
+            polys = first_value(data, "rec_polys", "dt_polys", "rec_boxes", "boxes")
+            poly_items = as_list(polys)
+            if not poly_items:
+                return False
+            texts = as_list(first_value(data, "rec_texts", "texts"))
+            scores = as_list(first_value(data, "rec_scores", "scores"))
+            for i, poly in enumerate(poly_items):
+                text = texts[i] if i < len(texts) else ""
+                score = scores[i] if i < len(scores) else 1.0
+                try:
+                    coords = [
+                        [float(point[0]), float(point[1])]
+                        for point in as_list(poly)
+                    ]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if coords:
+                    add_box(coords, str(text) if text is not None else "", score)
+            return True
+
+        def add_legacy_detection(item: Any) -> bool:
+            """Parse one Paddle 2.x detection: ``[box, (text, score)]``."""
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                return False
+            payload = item[1]
+            if not isinstance(payload, (list, tuple)) or not payload:
+                return False
+            text = payload[0]
+            score = payload[1] if len(payload) > 1 else 1.0
+            add_box(item[0], str(text) if text is not None else "", score)
+            return True
 
         if result is None:
             return boxes
@@ -366,44 +425,32 @@ class PPOCRLocalEngine(OCREngine):
             if page is None:
                 continue
             # 3.x object with rec_polys / rec_boxes
-            polys = getattr(page, "rec_polys", None) or getattr(page, "dt_polys", None)
-            texts = getattr(page, "rec_texts", None) or []
-            scores = getattr(page, "rec_scores", None) or []
-            if polys is not None:
-                for i, poly in enumerate(list(polys)):
-                    t = texts[i] if i < len(texts) else ""
-                    s = scores[i] if i < len(scores) else 1.0
-                    try:
-                        coords = [[float(p[0]), float(p[1])] for p in poly]
-                        add_box(coords, str(t) if t is not None else "", float(s))
-                    except Exception:
-                        continue
+            if add_components(page):
                 continue
             if isinstance(page, dict):
-                for key in ("rec_polys", "dt_polys", "boxes"):
-                    if key in page and isinstance(page[key], list):
-                        polys = page[key]
-                        texts = page.get("rec_texts") or page.get("texts") or []
-                        scores = page.get("rec_scores") or page.get("scores") or []
-                        for i, poly in enumerate(polys):
-                            t = texts[i] if i < len(texts) else ""
-                            s = scores[i] if i < len(scores) else 1.0
-                            add_box(poly, str(t) if t is not None else "", float(s or 1.0))
-                        break
+                nested = page.get("res")
+                if isinstance(nested, dict):
+                    add_components(nested)
+                continue
+            if hasattr(page, "json"):
+                try:
+                    payload = page.json
+                    if callable(payload):
+                        payload = payload()
+                    if isinstance(payload, dict):
+                        nested = payload.get("res", payload)
+                        if isinstance(nested, dict):
+                            add_components(nested)
+                except Exception:
+                    pass
                 continue
             # Legacy 2.x: [[box, (text, score)], ...]
             if isinstance(page, list):
+                if add_legacy_detection(page):
+                    continue
                 for item in page:
                     try:
-                        if (
-                            isinstance(item, (list, tuple))
-                            and len(item) >= 2
-                            and isinstance(item[1], (list, tuple))
-                        ):
-                            box, payload = item[0], item[1]
-                            text = payload[0] if payload else ""
-                            score = float(payload[1]) if len(payload) > 1 else 1.0
-                            add_box(box, str(text), score)
+                        add_legacy_detection(item)
                     except Exception:
                         continue
         return boxes

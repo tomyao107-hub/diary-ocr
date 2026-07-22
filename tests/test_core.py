@@ -129,6 +129,35 @@ class CoreTests(unittest.TestCase):
                 )
                 self.assertTrue(output.exists())
 
+    def test_batch_recognize_type_error_is_not_retried_with_another_signature(self):
+        calls = []
+
+        def broken_recognize(jpeg_bytes: bytes, path: str) -> str:
+            calls.append((jpeg_bytes, path))
+            raise TypeError("internal callback failure")
+
+        worker = app_module.BatchOCRWorker(
+            [], FakeOCRClient(), "unused", recognize_fn=broken_recognize
+        )
+
+        with self.assertRaisesRegex(TypeError, "internal callback failure"):
+            worker._recognize_bytes(b"image", "page.jpg")
+        self.assertEqual(calls, [(b"image", "page.jpg")])
+
+    def test_batch_recognize_keeps_one_argument_callbacks_compatible(self):
+        calls = []
+
+        def recognize(jpeg_bytes: bytes) -> str:
+            calls.append(jpeg_bytes)
+            return "ok"
+
+        worker = app_module.BatchOCRWorker(
+            [], FakeOCRClient(), "unused", recognize_fn=recognize
+        )
+
+        self.assertEqual(worker._recognize_bytes(b"image", "page.jpg"), "ok")
+        self.assertEqual(calls, [b"image"])
+
     def test_merge_uses_current_queue_order_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
